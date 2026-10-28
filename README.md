@@ -33,7 +33,11 @@ building one from scratch. That's what's in progress.
 - `web/` - a frontend scaffold (status page + dev server with the COOP/COEP isolation headers a
   future pthreads-enabled wasm build will need). No wasm module exists yet for it to load -
   `npm run serve` and open `http://localhost:8766` to see the status page and a file picker that
-  inspects a dropped file locally without running it.
+  inspects a dropped file locally without running it. Styled to match
+  [azahar_web](https://github.com/Shubin123/azahar_web)'s widget-card layout.
+  Live at **<https://shubin123.github.io/shadps4_web/>**, deployed via `scripts/deploy_pages.sh`
+  to a `gh-pages` branch (GitHub Pages "deploy from a branch" - no GitHub Actions workflow).
+  Re-run that script after editing `web/index.html` to publish the change.
 
 See [PROJECT.md](PROJECT.md) for the full architecture, what's actually implemented vs. planned,
 and the two big pieces of remaining work (guest virtual memory, and wiring the interpreter into
