@@ -34,12 +34,13 @@ actually exists today, not a plan dressed up as progress.
 |---|---|---|
 | M1 | x86-64 instruction interpreter core (register file, flags, ALU/control-flow dispatch) | **Done for the implemented subset** - see Instruction coverage below |
 | M2 | Guest\<->host call boundary (HostThunkTable) | **Done** for the mechanism itself; not yet connected to shadPS4's real `Linker`/`aerolib` import resolution |
-| M3 | Standalone test harness proving M1+M2 against hand-assembled machine code | **Done** - `tests/interpreter/`, 10/10 checks passing |
-| M4 | Guest virtual memory (software MMU replacing `Core::AddressSpace`'s identity mapping) | **Not started** - see below, this is probably the single largest remaining piece |
-| M5 | Wiring into shadPS4 proper (`Core::Linker::RunMainEntry`, module init/fini, thread entry, TLS, the ~23 other guest-callable-pointer sites) | **Not started** |
-| M6 | Emscripten/CMake build integration for shadPS4 itself | **Not started** |
+| M3 | Standalone test harness proving M1+M2 against hand-assembled machine code | **Done** - `tests/interpreter/`, 16/16 checks passing |
+| M4 | Guest virtual memory (software MMU replacing `Core::AddressSpace`'s identity mapping) | **Started**: `GuestAddressSpace` exists and is tested standalone (region-list based, not a page table - see below for why). **Not started**: porting the real `Core::Memory`/`AddressSpace` itself, and the HLE-wide audit of `VAddr`-as-host-pointer call sites |
+| M5 | Wiring into shadPS4 proper (`Core::Linker::RunMainEntry`, module init/fini, thread entry, TLS, the ~23 other guest-callable-pointer sites) | **Started**: `patches/0001-linker-emscripten-run-main-entry.patch` connects `RunMainEntry` to the interpreter, verified with `git apply --check` against a real shadPS4 checkout. **Not yet buildable** - blocked on the rest of M4 and all of M6 (see the patch's own comments for specifics). Module init/fini, thread entry, TLS, and the other ~22 sites: not started |
+| M6 | Emscripten/CMake build integration for shadPS4 itself | **Not started.** One concrete blocker already located: the top-level `CMakeLists.txt`'s architecture detection (`BASE_ARCHITECTURE` matched against x86/arm64 regexes) hard-fails with `FATAL_ERROR "Unsupported CPU architecture"` for wasm32/wasm64 before reaching anything target-specific |
 | M7 | SSE/AVX floating point and REP-prefixed string instructions in the interpreter | **Not started** - deliberately deferred, see below |
 | M8 | Vulkan -> web graphics (WebGPU or similar) | **Not started**, independent of M1-M7 |
+| M9 | `shadps4_web` frontend (`web/`) | **Scaffold only**: dev server with COOP/COEP isolation headers (needed for any future pthreads build), a status page reflecting this table, and a file picker that reads a dropped file's header locally and reports what it is - explicitly does not execute anything, because nothing here can yet |
 
 "Done" above means: implemented, and verified against real test cases that exercise it - not
 "written and assumed correct." M1-M3 already caught one real bug this way (see Interpreter
@@ -63,19 +64,30 @@ checkout yet (there is no CMake integration - M6 above) - today it only builds s
 `tests/interpreter/CMakeLists.txt`, against a vendored Zydis for decoding.
 
 ```
-patches/new_files/core/interpreter/
-  guest_memory.h          GuestMemory: the memory-access seam (see M4 discussion)
-  x86_register_file.h/.cpp  CpuState: GPRs, RFLAGS, XMM slots, FS/GS bases
-  host_thunk.h/.cpp        HostThunkTable: the guest<->host call-boundary mechanism
-  x86_interpreter.h/.cpp   The decode/dispatch loop itself
+patches/
+  0001-linker-emscripten-run-main-entry.patch
+                           A real diff against shadPS4's src/core/linker.cpp, verified with
+                           `git apply --check` against an actual checkout. Connects
+                           RunMainEntry to the interpreter. Not yet buildable - see its own
+                           comments for exactly what's still missing (the rest of M4, and M6).
+  new_files/core/interpreter/
+    guest_memory.h          GuestMemory: the memory-access seam (see M4 discussion)
+    guest_address_space.h/.cpp  GuestAddressSpace: the M4 stand-in for Core::AddressSpace
+    x86_register_file.h/.cpp  CpuState: GPRs, RFLAGS, XMM slots, FS/GS bases
+    host_thunk.h/.cpp        HostThunkTable: the guest<->host call-boundary mechanism
+    x86_interpreter.h/.cpp   The decode/dispatch loop itself
 tests/interpreter/
   CMakeLists.txt           Standalone build (fetches nothing from shadPS4 except Zydis)
-  test_main.cpp            10 checks against hand-assembled x86-64 bytes
+  test_main.cpp            16 checks against hand-assembled x86-64 bytes
   disasm_check.cpp         Throwaway helper: disassembles a byte array with Zydis's own
                            formatter, to verify hand-encoded test bytes actually mean what a
                            comment claims. Keep using this before trusting new hand-assembled
                            test cases - that's exactly how the EffectiveAddress bug below was
                            confirmed, not guessed at a second time.
+web/
+  index.html, server.cjs  M9 (frontend) scaffold - a status page and a dev server with the
+                           COOP/COEP isolation headers any future pthreads-enabled wasm build
+                           will need. No wasm module exists for it to load yet.
 ```
 
 Run the tests:
@@ -161,6 +173,20 @@ mapping cannot exist in the Emscripten build, which means:
   `Common::MultiLevelPageTable<Entry=u8*>`, and the committed-pages discipline it already has is a
   reasonable starting point to adapt rather than replace outright), but "audit and fix every call
   site across the HLE tree that currently assumes `VAddr == uintptr_t`."
+- **What `GuestAddressSpace` actually does** (the M4 stand-in built so far,
+  `patches/new_files/core/interpreter/guest_address_space.{h,cpp}`): a sorted list of mapped
+  regions, each its own heap allocation, not a page table. A page-table-per-16KB-page scheme
+  (mirroring `AddressSpace::BackingPageTable` exactly, as the paragraph above suggests) was
+  considered and specifically rejected for now: `GuestMemory::Translate()` has to hand back one
+  contiguous host pointer for the requested range, and independently-allocated pages aren't
+  contiguous with each other any more than independently-allocated regions are - a page-table
+  version would hit the exact same "can't span a boundary" limitation one level down, for more
+  implementation complexity, not less. `GuestAddressSpace` accepts that limitation explicitly
+  (`Translate()` returns `nullptr` for a request spanning two separately-mapped regions, and
+  `GuestMemory`'s `Read`/`Write`/etc. now abort with a diagnostic on that rather than segfaulting -
+  see guest_memory.h) rather than hiding it behind a page table that merely relocates the same
+  problem. Revisit if something real needs a request spanning two independently-`Map()`'d
+  regions to work - nothing has hit that yet.
 - A second, specific wrinkle found while building the interpreter: `Linker::RunMainEntry` hands
   guest code a *host* global's address (`Libraries::Kernel::entry_params`) in `rdi`, expecting
   guest code to dereference it - which only works today because host and guest share one address

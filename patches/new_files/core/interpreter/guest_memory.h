@@ -17,6 +17,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace Core::Interpreter {
@@ -35,6 +37,7 @@ public:
 
     std::uint64_t Read(VAddr vaddr, std::size_t size) {
         const std::uint8_t* p = Translate(vaddr, size, /*for_write=*/false);
+        FaultIfNull(p, vaddr, size);
         std::uint64_t value = 0;
         for (std::size_t i = 0; i < size; i++) {
             value |= static_cast<std::uint64_t>(p[i]) << (8 * i);
@@ -44,6 +47,7 @@ public:
 
     void Write(VAddr vaddr, std::uint64_t value, std::size_t size) {
         std::uint8_t* p = Translate(vaddr, size, /*for_write=*/true);
+        FaultIfNull(p, vaddr, size);
         for (std::size_t i = 0; i < size; i++) {
             p[i] = static_cast<std::uint8_t>(value >> (8 * i));
         }
@@ -51,12 +55,33 @@ public:
 
     void ReadBytes(VAddr vaddr, void* out, std::size_t size) {
         const std::uint8_t* p = Translate(vaddr, size, /*for_write=*/false);
+        FaultIfNull(p, vaddr, size);
         std::memcpy(out, p, size);
     }
 
     void WriteBytes(VAddr vaddr, const void* in, std::size_t size) {
         std::uint8_t* p = Translate(vaddr, size, /*for_write=*/true);
+        FaultIfNull(p, vaddr, size);
         std::memcpy(p, in, size);
+    }
+
+private:
+    // A null Translate() result means "not mapped, or this request doesn't fit in one mapped
+    // region" (see GuestAddressSpace's documented limitation). Without this check, every one of
+    // the methods above would silently dereference a null pointer and segfault the host process
+    // instead of failing with a diagnostic - which is exactly what happened to the interpreter's
+    // instruction fetch path before Step() added its own explicit check (see x86_interpreter.cpp,
+    // Fatal() call in Step()). Centralizing the check here means every other guest memory access
+    // (ReadOperand/WriteOperand/Push/Pop/...) gets the same protection without each needing its
+    // own copy of this check.
+    static void FaultIfNull(const void* p, VAddr vaddr, std::size_t size) {
+        if (p == nullptr) {
+            std::fprintf(stderr,
+                          "Core::Interpreter: guest memory fault: %zu-byte access at %#llx is "
+                          "not mapped (or straddles two separately-mapped regions)\n",
+                          size, static_cast<unsigned long long>(vaddr));
+            std::abort();
+        }
     }
 };
 

@@ -39,6 +39,7 @@ add_library(shadps4_interpreter STATIC
     "${INTERPRETER_SRC_DIR}/core/interpreter/x86_register_file.cpp"
     "${INTERPRETER_SRC_DIR}/core/interpreter/host_thunk.cpp"
     "${INTERPRETER_SRC_DIR}/core/interpreter/x86_interpreter.cpp"
+    "${INTERPRETER_SRC_DIR}/core/interpreter/guest_address_space.cpp"
 )
 target_include_directories(shadps4_interpreter PUBLIC "${INTERPRETER_SRC_DIR}")
 target_link_libraries(shadps4_interpreter PUBLIC Zydis)

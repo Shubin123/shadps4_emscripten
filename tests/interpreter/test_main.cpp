@@ -11,6 +11,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+#include "core/interpreter/guest_address_space.h"
 #include "core/interpreter/guest_memory.h"
 #include "core/interpreter/host_thunk.h"
 #include "core/interpreter/x86_interpreter.h"
@@ -195,6 +196,55 @@ void TestRunMainEntryStackLayout() {
     Check(threw, "TestRunMainEntryStackLayout: exit thunk was reached");
 }
 
+// --- Test F: GuestAddressSpace in isolation -----------------------------------------------------
+void TestGuestAddressSpaceBasics() {
+    GuestAddressSpace space;
+    const std::uint64_t region_a = space.MapAnywhere(0x1000);
+    const std::uint64_t region_b = space.MapAnywhere(0x2000);
+    Check(region_b >= region_a + 0x1000, "TestGuestAddressSpaceBasics: regions don't overlap");
+
+    space.Write(region_a + 8, 0xDEAD'BEEFu, 4);
+    Check(space.Read(region_a + 8, 4) == 0xDEAD'BEEFu,
+          "TestGuestAddressSpaceBasics: round-trips a write inside a mapped region");
+    Check(space.Read(region_a, 4) == 0, "TestGuestAddressSpaceBasics: mappings start zeroed");
+
+    // A request straddling the end of a mapped region (documented limitation - see
+    // guest_address_space.h) returns nullptr from Translate() directly. Deliberately checking
+    // Translate() itself here rather than going through GuestMemory::Read()/Write(): those
+    // dereference whatever Translate() returns with no null check (by design - see
+    // guest_memory.h), so calling them on an out-of-range request would crash the process
+    // rather than fail a check. The interpreter's own Step() already treats a null Translate()
+    // result as a fault (see the Fatal() call there); ReadOperand()/WriteOperand() don't yet -
+    // that's a real follow-up, not something to paper over with a try/catch here.
+    Check(space.Translate(region_a + 0x1000 - 2, 4, false) == nullptr,
+          "TestGuestAddressSpaceBasics: a request straddling a region's end is rejected");
+
+    space.Unmap(region_a);
+    Check(space.Translate(region_a, 1, false) == nullptr,
+          "TestGuestAddressSpaceBasics: Unmap() makes the region untranslatable");
+}
+
+// --- Test G: the interpreter running entirely on GuestAddressSpace (not the flat test buffer) --
+// Same computation as TestAddFunction, but through the real memory abstraction this is meant to
+// replace Core::AddressSpace with, including code and stack living in separately-mapped regions
+// (the way a real ELF's code segment and stack normally would be).
+void TestInterpreterOverGuestAddressSpace() {
+    GuestAddressSpace space;
+    HostThunkTable thunks;
+    X86Interpreter cpu(space, thunks);
+
+    const std::uint64_t code_region = space.MapAnywhere(0x1000);
+    const std::uint64_t stack_region = space.MapAnywhere(0x4000);
+    std::uint8_t* code = space.Translate(code_region, 5, true);
+    const std::uint8_t bytes[] = {0x89, 0xF8, 0x01, 0xF0, 0xC3}; // mov eax,edi; add eax,esi; ret
+    std::memcpy(code, bytes, sizeof(bytes));
+
+    cpu.State().Reg(Gpr::Rsp) = stack_region + 0x4000; // stack grows down from the region's top
+    const std::uint64_t result = cpu.CallGuestFunction(code_region, {10, 32});
+    Check(result == 42, "TestInterpreterOverGuestAddressSpace: 10 + 32 == 42, via two separately "
+                         "mapped regions for code and stack");
+}
+
 } // namespace
 
 int main() {
@@ -203,6 +253,8 @@ int main() {
     TestCompareEqual();
     TestHostThunkBoundary();
     TestRunMainEntryStackLayout();
+    TestGuestAddressSpaceBasics();
+    TestInterpreterOverGuestAddressSpace();
 
     if (g_failures > 0) {
         std::fprintf(stderr, "\n%d check(s) FAILED\n", g_failures);
