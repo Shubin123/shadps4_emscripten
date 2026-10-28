@@ -40,7 +40,7 @@ actually exists today, not a plan dressed up as progress.
 | M6 | Emscripten/CMake build integration for shadPS4 itself | **Not started.** One concrete blocker already located: the top-level `CMakeLists.txt`'s architecture detection (`BASE_ARCHITECTURE` matched against x86/arm64 regexes) hard-fails with `FATAL_ERROR "Unsupported CPU architecture"` for wasm32/wasm64 before reaching anything target-specific |
 | M7 | SSE/AVX floating point and REP-prefixed string instructions in the interpreter | **Not started** - deliberately deferred, see below |
 | M8 | Vulkan -> web graphics (WebGPU or similar) | **Not started**, independent of M1-M7 |
-| M9 | `shadps4_web` frontend (`web/`) | **Scaffold only**: dev server with COOP/COEP isolation headers (needed for any future pthreads build), a status page reflecting this table, and a file picker that reads a dropped file's header locally and reports what it is - explicitly does not execute anything, because nothing here can yet |
+| M9 | Frontend, in the separate [shadps4_web](https://github.com/Shubin123/shadps4_web) repo | **Scaffold only**: dev server with COOP/COEP isolation headers (needed for any future pthreads build), a status page reflecting this table, and a file picker that reads a dropped file's header locally and reports what it is - explicitly does not execute anything, because nothing here can yet |
 
 "Done" above means: implemented, and verified against real test cases that exercise it - not
 "written and assumed correct." M1-M3 already caught one real bug this way (see Interpreter
@@ -84,10 +84,6 @@ tests/interpreter/
                            comment claims. Keep using this before trusting new hand-assembled
                            test cases - that's exactly how the EffectiveAddress bug below was
                            confirmed, not guessed at a second time.
-web/
-  index.html, server.cjs  M9 (frontend) scaffold - a status page and a dev server with the
-                           COOP/COEP isolation headers any future pthreads-enabled wasm build
-                           will need. No wasm module exists for it to load yet.
 ```
 
 Run the tests:
