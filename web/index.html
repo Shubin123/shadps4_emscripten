@@ -1,178 +1,367 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>shadps4_web</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>shadPS4 Web — PlayStation 4 Emulator (WIP)</title>
 <style>
-  :root {
-    --bg: #0b0d12;
-    --panel: #12151c;
-    --border: #232835;
-    --text: #d7dce3;
-    --muted: #8b94a5;
-    --accent: #5b8cff;
-    --ok: #4caf7d;
-    --pending: #c9a24b;
-    --todo: #7d8597;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  }
-  header {
-    padding: 28px 20px 16px;
-    max-width: 880px;
-    margin: 0 auto;
-  }
-  h1 { margin: 0 0 6px; font-size: 22px; letter-spacing: 0.2px; }
-  .sub { color: var(--muted); font-size: 14px; }
-  main { max-width: 880px; margin: 0 auto; padding: 0 20px 48px; }
-  .panel {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 18px 20px;
-    margin-bottom: 18px;
-  }
-  .panel h2 { margin: 0 0 10px; font-size: 15px; color: var(--text); }
-  .panel p { margin: 6px 0; color: var(--muted); font-size: 13.5px; }
-  .status-grid { display: grid; grid-template-columns: 1fr auto; gap: 6px 14px; font-size: 13.5px; }
-  .status-grid .label { color: var(--text); }
-  .badge {
-    display: inline-block;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.3px;
-    text-transform: uppercase;
-    padding: 2px 8px;
-    border-radius: 999px;
-  }
-  .badge.ok { background: rgba(76,175,125,0.15); color: var(--ok); }
-  .badge.pending { background: rgba(201,162,75,0.15); color: var(--pending); }
-  .badge.todo { background: rgba(125,133,151,0.15); color: var(--todo); }
-  .drop {
-    border: 1.5px dashed var(--border);
-    border-radius: 10px;
-    padding: 28px 20px;
-    text-align: center;
-    color: var(--muted);
-    font-size: 13.5px;
-    cursor: pointer;
-    transition: border-color .15s;
-  }
-  .drop:hover, .drop.drag { border-color: var(--accent); color: var(--text); }
-  .drop input { display: none; }
-  #fileInfo {
-    margin-top: 14px;
-    font-size: 13px;
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    color: var(--text);
-    white-space: pre-wrap;
-    display: none;
-  }
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  footer { color: var(--muted); font-size: 12.5px; text-align: center; padding: 20px; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        background: #1a1a2e;
+        color: #e0e0e0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        min-height: 100vh;
+        padding: 16px;
+    }
+    header { text-align: center; margin-bottom: 16px; max-width: 900px; }
+    header h1 { font-size: 1.5rem; color: #ff6b6b; }
+    header p { font-size: 0.85rem; color: #888; margin-top: 2px; }
+    header .links { margin-top: 8px; font-size: 0.78rem; }
+    header .links a { color: #89b4fa; text-decoration: none; margin: 0 6px; }
+    header .links a:hover { text-decoration: underline; }
+
+    .banner {
+        max-width: 804px;
+        width: 100%;
+        background: #2b1f17;
+        border: 1px solid #5a3b1f;
+        border-radius: 6px;
+        padding: 10px 14px;
+        font-size: 0.78rem;
+        color: #e0b989;
+        margin-bottom: 16px;
+        line-height: 1.5;
+    }
+    .banner strong { color: #ffcf8a; }
+    .banner a { color: #89b4fa; }
+
+    .main-layout {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+        max-width: 1400px;
+        width: 100%;
+        justify-content: center;
+        align-items: flex-start;
+    }
+    .canvas-panel { flex: 0 0 420px; max-width: 420px; width: 100%; text-align: center; }
+    .screen-stage { position: relative; }
+    canvas {
+        border: 2px solid #333;
+        border-radius: 4px;
+        background: #000;
+        width: 100%;
+        display: block;
+        image-rendering: pixelated;
+    }
+    .screen-stage.is-fullscreen { width: 100vw; height: 100dvh; background: #000; }
+    .screen-stage.is-fullscreen canvas { width: 100%; height: 100%; border: 0; border-radius: 0; object-fit: contain; }
+    .stage-fullscreen-btn {
+        position: absolute;
+        right: 10px;
+        bottom: 10px;
+        width: 34px;
+        height: 34px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        border: 1px solid #0f3460;
+        border-radius: 6px;
+        background: rgba(15,52,96,.75);
+        color: #e0e0e0;
+        cursor: pointer;
+        opacity: .65;
+        transition: opacity .2s;
+    }
+    .stage-fullscreen-btn:hover { opacity: 1; }
+    .stage-fullscreen-btn svg { width: 60%; height: 60%; }
+    .canvas-caption { font-size: 0.7rem; color: #555; margin-top: 4px; }
+
+    .controls-panel {
+        flex: 1 1 560px;
+        min-width: 0;
+        width: 100%;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+        gap: 12px;
+        align-items: start;
+    }
+    .card {
+        background: #16213e;
+        border: 1px solid #0f3460;
+        border-radius: 8px;
+        padding: 16px;
+        min-width: 0;
+        box-shadow: inset 1px 1px 0 rgba(183,207,255,.12), inset -1px -1px 0 rgba(0,0,0,.45), 0 5px 14px rgba(0,0,0,.2);
+    }
+    .card h2 {
+        font-size: 1rem;
+        margin-bottom: 10px;
+        color: #e94560;
+        border-bottom: 1px solid #0f3460;
+        padding-bottom: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        cursor: pointer;
+        user-select: none;
+    }
+    .card h2 .collapse-arrow { font-size: 0.75rem; color: #5b6b8f; transition: transform .15s; }
+    .card.is-collapsed h2 { margin-bottom: 0; border-bottom: 0; padding-bottom: 0; }
+    .card.is-collapsed h2 .collapse-arrow { transform: rotate(-90deg); }
+    .card.is-collapsed > :not(h2) { display: none; }
+
+    .btn {
+        display: inline-block;
+        padding: 8px 16px;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 0.9rem;
+        font-weight: 600;
+        text-align: center;
+        width: 100%;
+        margin-bottom: 6px;
+        transition: opacity 0.2s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary { background: #e94560; color: #fff; }
+    .btn-secondary { background: #0f3460; color: #e0e0e0; }
+    .btn-success { background: #2d6a4f; color: #fff; }
+
+    input[type="file"] { display: none; }
+    .file-label {
+        display: block;
+        padding: 8px 16px;
+        border: 2px dashed #0f3460;
+        border-radius: 4px;
+        cursor: pointer;
+        text-align: center;
+        font-size: 0.85rem;
+        margin-bottom: 6px;
+        word-break: break-all;
+        transition: border-color .15s;
+    }
+    .file-label:hover, .file-label.drag { border-color: #e94560; }
+
+    .renderer-select, textarea.renderer-select {
+        width: 100%;
+        margin-bottom: 6px;
+        padding: 8px;
+        border: 1px solid #0f3460;
+        border-radius: 4px;
+        background: #0a0a1a;
+        color: #e0e0e0;
+        font-family: inherit;
+        font-size: 0.85rem;
+    }
+    .mode-help { font-size: 0.72rem; color: #888; line-height: 1.4; }
+    .mode-help.warn { color: #e0b989; }
+    .field-label { display: block; margin-top: 10px; margin-bottom: 4px; font-size: 0.76rem; color: #aaa; }
+
+    .audio-toggle { display: flex; gap: 6px; align-items: flex-start; margin-top: 8px; cursor: pointer; }
+    .audio-toggle input { accent-color: #e94560; margin-top: 2px; }
+    .audio-toggle.locked { cursor: default; opacity: .75; }
+
+    .speed-control { margin-top: 10px; }
+    .speed-control label { display: flex; justify-content: space-between; color: #aaa; font-size: 0.76rem; margin-bottom: 4px; }
+    .speed-control input { width: 100%; accent-color: #e94560; }
+
+    .status-row { display: flex; justify-content: space-between; gap: 8px; font-size: 0.78rem; padding: 3px 0; }
+    .status-row .label { color: #c9d4ea; }
+    .pill {
+        font-size: 0.64rem;
+        font-weight: 700;
+        letter-spacing: .3px;
+        text-transform: uppercase;
+        padding: 2px 8px;
+        border-radius: 999px;
+        white-space: nowrap;
+    }
+    .pill.ok { background: rgba(45,106,79,.35); color: #8fd6a6; }
+    .pill.pending { background: rgba(224,185,137,.2); color: #e0b989; }
+    .pill.todo { background: rgba(102,115,140,.25); color: #9aa6bd; }
+
+    #file-info {
+        margin-top: 10px;
+        font-size: 0.72rem;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        color: #c9d4ea;
+        white-space: pre-wrap;
+        background: #0d1730;
+        border: 1px solid #253d69;
+        border-radius: 5px;
+        padding: 8px;
+        display: none;
+    }
+
+    @media (max-width: 760px) {
+        .canvas-panel { flex: 1 1 auto; max-width: 100%; }
+    }
 </style>
 </head>
 <body>
 <header>
-  <h1>shadps4_web</h1>
-  <div class="sub">An in-progress WebAssembly build of
-    <a href="https://github.com/shadps4-emu/shadps4" target="_blank" rel="noopener">shadPS4</a>.
-    Nothing here runs a game yet &mdash; see below.</div>
-</header>
-<main>
-
-  <div class="panel">
-    <h2>Why there's no "load a game" button that does anything</h2>
-    <p>
-      shadPS4 runs PS4 (x86-64) game code directly on the host CPU rather than emulating it,
-      which WebAssembly has no way to do at all. Making that work means building a real,
-      from-scratch x86-64 interpreter first &mdash; not something a browser page can route
-      around. That interpreter exists and is tested, but it isn't wired into a buildable
-      shadPS4+Emscripten binary yet, so there is no <code>.wasm</code> module for this page to
-      load. Full details and current status: <a href="../PROJECT.md">PROJECT.md</a>.
-    </p>
-  </div>
-
-  <div class="panel">
-    <h2>Status</h2>
-    <div class="status-grid">
-      <div class="label">x86-64 interpreter core (registers, flags, ALU/control flow)</div>
-      <div><span class="badge ok">implemented</span></div>
-      <div class="label">Guest&lt;-&gt;host call boundary (HostThunkTable)</div>
-      <div><span class="badge ok">implemented</span></div>
-      <div class="label">Guest virtual memory (GuestAddressSpace)</div>
-      <div><span class="badge pending">started</span></div>
-      <div class="label">Wired into shadPS4's linker/HLE code</div>
-      <div><span class="badge pending">started</span></div>
-      <div class="label">Emscripten/CMake build of shadPS4 itself</div>
-      <div><span class="badge todo">not started</span></div>
-      <div class="label">Vulkan&#8594;web graphics</div>
-      <div><span class="badge todo">not started</span></div>
-      <div class="label">This page actually running a game</div>
-      <div><span class="badge todo">not yet</span></div>
+    <h1>🕹 shadPS4 Web</h1>
+    <p>PlayStation 4 Emulator — WebAssembly attempt, in progress</p>
+    <div class="links">
+        <a href="https://github.com/shadps4-emu/shadps4" target="_blank" rel="noopener">shadPS4 upstream</a>·
+        <a href="https://github.com/Shubin123/shadps4_web" target="_blank" rel="noopener">this repo</a>·
+        <a href="https://github.com/Shubin123/shadps4_web/blob/main/PROJECT.md" target="_blank" rel="noopener">PROJECT.md</a>
     </div>
-  </div>
+</header>
 
-  <div class="panel">
-    <h2>Try the file picker</h2>
-    <p>This reads the file locally in your browser and shows what it is &mdash; it does not
-      upload it anywhere, and it does not run it. That part doesn't exist yet.</p>
-    <label class="drop" id="drop">
-      <input type="file" id="fileInput">
-      Drop a PS4 ELF/PKG here, or click to choose a file
-    </label>
-    <div id="fileInfo"></div>
-  </div>
+<div class="banner">
+    <strong>Nothing below runs a game.</strong> shadPS4 runs PS4 (x86-64) code directly on the
+    host CPU instead of emulating it, which WebAssembly can't do at all — so unlike a
+    Citra/Azahar-style port, there was no existing CPU interpreter to carry over. One is being
+    built from scratch (register file, flags, control flow — tested, see
+    <a href="https://github.com/Shubin123/shadps4_web/blob/main/PROJECT.md" target="_blank" rel="noopener">PROJECT.md</a>),
+    but it isn't wired into a buildable shadPS4+Emscripten binary yet. The settings below reflect
+    where things are, or are heading, not what works today.
+</div>
 
-</main>
-<footer>
-  <a href="https://github.com/Shubin123/shadps4_web" target="_blank" rel="noopener">source</a>
-</footer>
+<div class="main-layout">
+    <div class="canvas-panel">
+        <div class="screen-stage" id="screen-stage">
+            <canvas id="canvas" width="960" height="540"></canvas>
+            <button type="button" class="stage-fullscreen-btn" id="btn-fullscreen-stage" title="Fullscreen" aria-label="Fullscreen">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/>
+                </svg>
+            </button>
+        </div>
+        <p class="canvas-caption">960×540 placeholder — no renderer exists yet</p>
+    </div>
+
+    <div class="controls-panel" id="widget-grid">
+
+        <div class="card" data-widget="status">
+            <h2><span>📋 Status</span><span class="collapse-arrow">▾</span></h2>
+            <div class="status-row"><span class="label">x86-64 interpreter core</span><span class="pill ok">implemented</span></div>
+            <div class="status-row"><span class="label">Guest↔host call boundary</span><span class="pill ok">implemented</span></div>
+            <div class="status-row"><span class="label">Guest virtual memory</span><span class="pill pending">started</span></div>
+            <div class="status-row"><span class="label">Wired into shadPS4's linker</span><span class="pill pending">started</span></div>
+            <div class="status-row"><span class="label">Emscripten/CMake build</span><span class="pill todo">not started</span></div>
+            <div class="status-row"><span class="label">Vulkan → web graphics</span><span class="pill todo">not started</span></div>
+            <div class="mode-help" style="margin-top:8px;">Full detail, milestone-by-milestone: <a href="https://github.com/Shubin123/shadps4_web/blob/main/PROJECT.md" target="_blank" rel="noopener" style="color:#89b4fa;">PROJECT.md</a>.</div>
+        </div>
+
+        <div class="card" data-widget="renderer">
+            <h2><span>🖥 Renderer</span><span class="collapse-arrow">▾</span></h2>
+            <select id="renderer-mode" class="renderer-select" aria-label="Renderer backend">
+                <option value="auto">Auto</option>
+                <option value="webgpu">WebGPU (planned)</option>
+                <option value="vulkan">Vulkan (native only — no browser support)</option>
+            </select>
+            <label for="resolution-scale" class="field-label">Internal resolution</label>
+            <select id="resolution-scale" class="renderer-select" aria-label="Internal resolution">
+                <option value="1">1x Native</option>
+                <option value="2">2x</option>
+                <option value="3">3x</option>
+            </select>
+            <div class="mode-help warn">shadPS4's renderer is Vulkan-only today; browsers expose no Vulkan. This card previews the intended options — neither has any effect yet.</div>
+        </div>
+
+        <div class="card" data-widget="cpu">
+            <h2><span>⚙ CPU</span><span class="collapse-arrow">▾</span></h2>
+            <label class="audio-toggle locked">
+                <input type="checkbox" checked disabled>
+                Use the x86-64 interpreter
+            </label>
+            <div class="mode-help">Not a choice — shadPS4 has no other way to run guest code in a browser. Direct host-CPU execution (what every other shadPS4 build does) is impossible inside WebAssembly.</div>
+            <div class="mode-help" style="margin-top:8px;">Not yet implemented in the interpreter: SSE/AVX floating point, REP-prefixed string instructions. See PROJECT.md, "Instruction coverage".</div>
+        </div>
+
+        <div class="card" data-widget="game-file">
+            <h2><span>📂 Game File</span><span class="collapse-arrow">▾</span></h2>
+            <input type="file" id="file-input" accept=".elf,.bin,.pkg,.oelf">
+            <label for="file-input" class="file-label" id="file-label">Drop a PS4 ELF/PKG here, or click to choose</label>
+            <button class="btn btn-primary" id="btn-load" disabled>Load &amp; Run</button>
+            <div id="file-status" class="mode-help">Reads the file locally in your browser to show what it is. Does not upload it, and does not run it.</div>
+            <div id="file-info"></div>
+        </div>
+
+        <div class="card" data-widget="emulation">
+            <h2><span>▶ Emulation</span><span class="collapse-arrow">▾</span></h2>
+            <button class="btn btn-primary" id="btn-init" disabled>Initialize</button>
+            <button class="btn btn-success" id="btn-step" disabled>Step Frame</button>
+            <button class="btn btn-secondary" id="btn-run" disabled>▶ Run</button>
+            <button class="btn btn-secondary" id="btn-stop" disabled>⏹ Stop</button>
+            <div class="mode-help">Disabled: there is no emulation core bound to this page. See the Status card.</div>
+        </div>
+
+        <div class="card" data-widget="fullscreen">
+            <h2><span>⛶ Display</span><span class="collapse-arrow">▾</span></h2>
+            <button type="button" class="btn btn-secondary" id="btn-fullscreen">⛶ Fullscreen</button>
+            <div class="mode-help" style="margin-top:4px;">This one actually works — it's just the browser Fullscreen API on the placeholder canvas.</div>
+        </div>
+
+    </div>
+</div>
+
 <script>
 (function () {
-  const drop = document.getElementById('drop');
-  const input = document.getElementById('fileInput');
-  const info = document.getElementById('fileInfo');
+    // Card collapse toggling - the one piece of "widget" interactivity this page implements for
+    // real, kept deliberately simple (no drag/resize/masonry layout manager).
+    document.querySelectorAll('.card > h2').forEach(h2 => {
+        h2.addEventListener('click', () => h2.closest('.card').classList.toggle('is-collapsed'));
+    });
 
-  function describe(file, bytes) {
-    const hex = Array.from(bytes.slice(0, 16))
-      .map(b => b.toString(16).padStart(2, '0')).join(' ');
-    const isElf = bytes.length >= 4 && bytes[0] === 0x7f && bytes[1] === 0x45 &&
-                  bytes[2] === 0x4c && bytes[3] === 0x46;
-    const lines = [
-      `name:  ${file.name}`,
-      `size:  ${file.size.toLocaleString()} bytes`,
-      `magic: ${hex}${bytes.length > 16 ? ' ...' : ''}`,
-      `looks like an ELF: ${isElf ? 'yes' : 'no'}`,
-      '',
-      'Nothing further happens: there is no emulation core in this page to hand it to yet.',
-    ];
-    info.textContent = lines.join('\n');
-    info.style.display = 'block';
-  }
+    // File inspector: reads the header locally and reports what it looks like. Does not upload
+    // the file anywhere and does not attempt to execute it - there is nothing here that could.
+    const fileInput = document.getElementById('file-input');
+    const fileLabel = document.getElementById('file-label');
+    const fileInfo = document.getElementById('file-info');
 
-  function handleFile(file) {
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => describe(file, new Uint8Array(reader.result));
-    reader.readAsArrayBuffer(file.slice(0, 64));
-  }
+    function describe(file, bytes) {
+        const hex = Array.from(bytes.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ');
+        const isElf = bytes.length >= 4 && bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46;
+        fileInfo.textContent = [
+            `name:  ${file.name}`,
+            `size:  ${file.size.toLocaleString()} bytes`,
+            `magic: ${hex}${bytes.length > 16 ? ' ...' : ''}`,
+            `looks like an ELF: ${isElf ? 'yes' : 'no'}`,
+        ].join('\n');
+        fileInfo.style.display = 'block';
+        fileLabel.textContent = file.name;
+    }
 
-  input.addEventListener('change', () => handleFile(input.files[0]));
-  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag'); });
-  drop.addEventListener('dragleave', () => drop.classList.remove('drag'));
-  drop.addEventListener('drop', e => {
-    e.preventDefault();
-    drop.classList.remove('drag');
-    handleFile(e.dataTransfer.files[0]);
-  });
+    function handleFile(file) {
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => describe(file, new Uint8Array(reader.result));
+        reader.readAsArrayBuffer(file.slice(0, 64));
+    }
+
+    fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
+    fileLabel.addEventListener('dragover', e => { e.preventDefault(); fileLabel.classList.add('drag'); });
+    fileLabel.addEventListener('dragleave', () => fileLabel.classList.remove('drag'));
+    fileLabel.addEventListener('drop', e => {
+        e.preventDefault();
+        fileLabel.classList.remove('drag');
+        handleFile(e.dataTransfer.files[0]);
+    });
+
+    // Fullscreen: real functionality, scoped to the browser's Fullscreen API on the stage.
+    const stage = document.getElementById('screen-stage');
+    function toggleFullscreen() {
+        if (!document.fullscreenElement) {
+            stage.requestFullscreen?.().catch(() => {});
+        } else {
+            document.exitFullscreen?.();
+        }
+    }
+    document.getElementById('btn-fullscreen').addEventListener('click', toggleFullscreen);
+    document.getElementById('btn-fullscreen-stage').addEventListener('click', toggleFullscreen);
+    document.addEventListener('fullscreenchange', () => {
+        stage.classList.toggle('is-fullscreen', !!document.fullscreenElement);
+    });
 })();
 </script>
 </body>
