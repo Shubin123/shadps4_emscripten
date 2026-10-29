@@ -88,13 +88,19 @@ void Submit(const u32* rgba, u32 width, u32 height, bool) {
     }
     DumpPpm(*slot, index);
     pending.store(1, std::memory_order_release);
+    // Copied out of linear memory here, in Emscripten's own JS scope, where its heap views are
+    // kept valid across memory growth; the page gets a plain RGBA array it can keep.
     MAIN_THREAD_ASYNC_EM_ASM(
         {
-            if (Module["shadps4OnFrame"]) {
-                Module["shadps4OnFrame"]($0, $1, $2, Number($3));
-            } else {
-                Module["_shadps4_display_release"]();
+            var ptr = Number($0);
+            var len = $1 * $2 * 4;
+            var cb = Module["shadps4OnFrame"];
+            if (cb) {
+                var rgba = new Uint8ClampedArray(len);
+                rgba.set(HEAPU8.subarray(ptr, ptr + len));
+                cb(rgba, $1, $2, Number($3));
             }
+            _shadps4_display_release();
         },
         slot->pixels.data(), width, height, index);
 }

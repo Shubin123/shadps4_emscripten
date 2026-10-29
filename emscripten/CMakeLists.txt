@@ -210,17 +210,18 @@ set(SHADPS4_LINK_FLAGS
 add_executable(shadps4_node "${NEW_FILES}/web/main_web.cpp")
 target_link_libraries(shadps4_node PRIVATE shadps4_core)
 target_link_options(shadps4_node PRIVATE ${SHADPS4_LINK_FLAGS} -sNODERAWFS=1 -sEXIT_RUNTIME=1
-                    -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/node_pre.js")
+                    -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js")
 
 # Browser build: the page mounts the game folder and drives main (see shadps4_web).
 add_executable(shadps4 "${NEW_FILES}/web/main_web.cpp")
 target_link_libraries(shadps4 PRIVATE shadps4_core)
 target_link_options(shadps4 PRIVATE ${SHADPS4_LINK_FLAGS} -sINVOKE_RUN=0 -sMODULARIZE=1
-                    -sEXPORT_NAME=createShadPS4 -sENVIRONMENT=web,worker -lworkerfs.js)
+                    -sEXPORT_NAME=createShadPS4 -sENVIRONMENT=web,worker
+                    "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js")
 
 # Interpreter tests (tests/interpreter): `node build/wasm/interpreter_tests.js`.
 add_executable(interpreter_tests "${REPO_ROOT}/tests/interpreter/test_main.cpp")
 target_link_libraries(interpreter_tests PRIVATE shadps4_core)
 target_include_directories(interpreter_tests PRIVATE "${REPO_ROOT}/tests/interpreter")
 target_link_options(interpreter_tests PRIVATE ${SHADPS4_LINK_FLAGS} -sNODERAWFS=1 -sEXIT_RUNTIME=1
-                    -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/node_pre.js")
+                    -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js")
