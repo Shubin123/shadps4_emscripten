@@ -1,0 +1,1296 @@
+diff --git a/src/common/arch.h b/src/common/arch.h
+index b22366c..888c098 100644
+--- a/src/common/arch.h
++++ b/src/common/arch.h
+@@ -7,4 +7,7 @@
+ #define ARCH_X86_64 1
+ #elif defined(__aarch64__) || defined(_M_ARM64)
+ #define ARCH_ARM64 1
++#elif defined(__EMSCRIPTEN__)
++// Guest x86-64 code is interpreted (core/interpreter), never executed by the host CPU.
++#define ARCH_WASM 1
+ #endif
+diff --git a/src/common/assert.cpp b/src/common/assert.cpp
+index a2b941a..4b51d51 100644
+--- a/src/common/assert.cpp
++++ b/src/common/assert.cpp
+@@ -10,6 +10,8 @@
+ #define Crash() __asm__ __volatile__("int $3")
+ #elif defined(ARCH_ARM64)
+ #define Crash() __asm__ __volatile__("brk 0")
++#elif defined(ARCH_WASM)
++#define Crash() __builtin_trap()
+ #else
+ #error "Missing Crash() implementation for target CPU architecture."
+ #endif
+diff --git a/src/common/rdtsc.h b/src/common/rdtsc.h
+index 4e4d584..0b02004 100644
+--- a/src/common/rdtsc.h
++++ b/src/common/rdtsc.h
+@@ -5,6 +5,10 @@
+ 
+ #include "common/arch.h"
+ 
++#ifdef ARCH_WASM
++#include <chrono>
++#endif
++
+ #ifdef _MSC_VER
+ #include <intrin.h>
+ #endif
+@@ -43,6 +47,9 @@ static inline u64 FencedRDTSC() {
+                  "isb\n\t"
+                  : "=r"(ret)::"memory");
+     return ret;
++#elif defined(ARCH_WASM)
++    // No cycle counter in wasm; a nanosecond clock gives EstimateRDTSCFrequency() 1GHz.
++    return static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+ #else
+ #error "Missing FencedRDTSC() implementation for target CPU architecture."
+ #endif
+diff --git a/src/common/signal_context.cpp b/src/common/signal_context.cpp
+index 874b6a4..4451b30 100644
+--- a/src/common/signal_context.cpp
++++ b/src/common/signal_context.cpp
+@@ -9,7 +9,7 @@
+ #elif defined(__FreeBSD__)
+ #include <machine/npx.h>
+ #include <sys/ucontext.h>
+-#else
++#elif !defined(ARCH_WASM)
+ #include <sys/ucontext.h>
+ #endif
+ 
+@@ -26,6 +26,8 @@ void* GetRip(void* ctx) {
+     return (void*)((ucontext_t*)ctx)->uc_mcontext.mc_rip;
+ #elif defined(ARCH_X86_64)
+     return (void*)((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RIP];
++#elif defined(ARCH_WASM)
++    return {};
+ #else
+ #error "Unsupported architecture"
+ #endif
+@@ -42,6 +44,8 @@ bool IsWriteError(void* ctx) {
+     return ((ucontext_t*)ctx)->uc_mcontext.mc_err & 0x2;
+ #elif defined(ARCH_X86_64)
+     return ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_ERR] & 0x2;
++#elif defined(ARCH_WASM)
++    return {};
+ #else
+ #error "Unsupported architecture"
+ #endif
+@@ -56,6 +60,8 @@ bool IsExecuteError(void* ctx) {
+     return ((ucontext_t*)ctx)->uc_mcontext.mc_err & 0x10;
+ #elif defined(ARCH_X86_64)
+     return ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_ERR] & 0x10;
++#elif defined(ARCH_WASM)
++    return {};
+ #else
+ #error "Unsupported architecture"
+ #endif
+diff --git a/src/common/slot_vector.cpp b/src/common/slot_vector.cpp
+index 16020b5..06acaa4 100644
+--- a/src/common/slot_vector.cpp
++++ b/src/common/slot_vector.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cstddef>
++#include <cstdlib>
++#include "common/arch.h"
+ #include "common/assert.h"
+ 
+ #ifdef _WIN32
+@@ -13,7 +15,13 @@
+ namespace Common {
+ 
+ void* ReserveMemoryPages(std::size_t size) noexcept {
+-#ifdef _WIN32
++#ifdef ARCH_WASM
++    // No reserve/commit distinction in wasm linear memory (and no MAP_FIXED to commit with);
++    // allocate zeroed storage up front. Pages nothing touches are still never committed by the
++    // browser, so this costs address space, not RAM.
++    void* const base = std::calloc(1, size);
++    ASSERT(base);
++#elif defined(_WIN32)
+     void* const base = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
+     ASSERT(base);
+ #else
+@@ -25,7 +33,9 @@ void* ReserveMemoryPages(std::size_t size) noexcept {
+ }
+ 
+ void CommitMemoryPages(void* address, std::size_t size) noexcept {
+-#ifdef _WIN32
++#ifdef ARCH_WASM
++    void* const result = address;
++#elif defined(_WIN32)
+     void* const result = VirtualAlloc(address, size, MEM_COMMIT, PAGE_READWRITE);
+ #else
+     void* const result =
+@@ -38,7 +48,9 @@ void ReleaseMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept
+     if (!base) {
+         return;
+     }
+-#ifdef _WIN32
++#ifdef ARCH_WASM
++    std::free(base);
++#elif defined(_WIN32)
+     ASSERT(VirtualFree(base, 0, MEM_RELEASE));
+ #else
+     ASSERT(munmap(base, size) == 0);
+diff --git a/src/common/va_ctx.h b/src/common/va_ctx.h
+index ed2deed..2e18289 100644
+--- a/src/common/va_ctx.h
++++ b/src/common/va_ctx.h
+@@ -7,6 +7,9 @@
+ 
+ #ifdef ARCH_X86_64
+ #include <xmmintrin.h>
++#elif defined(ARCH_WASM)
++typedef float __m128 __attribute__((__vector_size__(16), __aligned__(16)));
++#include "core/interpreter/hle.h"
+ #else
+ // FIXME
+ typedef __int128 __m128;
+@@ -36,7 +39,18 @@ typedef __int128 __m128;
+     (ctx).va_list.reg_save_area = &(ctx).reg_save_area;                                            \
+     (ctx).va_list.gp_offset = offsetof(::Common::VaRegSave, gp);                                   \
+     (ctx).va_list.fp_offset = offsetof(::Common::VaRegSave, fp);                                   \
+-    (ctx).va_list.overflow_arg_area = &overflow_arg_area;
++    VA_CTX_OVERFLOW_AREA(ctx)
++
++#ifdef ARCH_WASM
++// The 7th integer argument (overflow_arg_area) arrives as a copy; the rest of the stack-passed
++// arguments are on the guest stack starting where it came from.
++#define VA_CTX_OVERFLOW_AREA(ctx)                                                                  \
++    (void)overflow_arg_area;                                                                       \
++    (ctx).va_list.overflow_arg_area =                                                              \
++        reinterpret_cast<void*>(::Core::Interpreter::CurrentHleStackArgs());
++#else
++#define VA_CTX_OVERFLOW_AREA(ctx) (ctx).va_list.overflow_arg_area = &overflow_arg_area;
++#endif
+ 
+ namespace Common {
+ 
+diff --git a/src/core/address_space.cpp b/src/core/address_space.cpp
+index 10b0bc3..b110715 100644
+--- a/src/core/address_space.cpp
++++ b/src/core/address_space.cpp
+@@ -22,6 +22,11 @@
+ #include <fcntl.h>
+ #include <sys/mman.h>
+ #endif
++#ifdef ARCH_WASM
++#include <unistd.h>
++#include <emscripten/heap.h>
++#include "core/wasm_layout.h"
++#endif
+ 
+ #if defined(__APPLE__) && defined(ARCH_X86_64)
+ // Reserve space for the system address space using a zerofill section.
+@@ -33,6 +38,15 @@ asm(".zerofill USER_AREA,USER_AREA,__USER_AREA,0x5F9000000000");
+ namespace Core {
+ 
+ // Constants used for mapping address space.
++#ifdef ARCH_WASM
++// See core/wasm_layout.h: the same regions, compressed to fit wasm64 linear memory.
++constexpr VAddr SYSTEM_MANAGED_MIN = WasmLayout::SystemManagedMin;
++constexpr VAddr SYSTEM_MANAGED_MAX = WasmLayout::SystemManagedMax;
++constexpr VAddr SYSTEM_RESERVED_MIN = WasmLayout::SystemReservedMin;
++constexpr VAddr SYSTEM_RESERVED_MAX = WasmLayout::SystemReservedMax;
++constexpr VAddr USER_MIN = WasmLayout::UserMin;
++constexpr VAddr USER_MAX = WasmLayout::UserMax;
++#else
+ constexpr VAddr SYSTEM_MANAGED_MIN = 0x400000ULL;
+ constexpr VAddr SYSTEM_MANAGED_MAX = 0x7FFFFBFFFULL;
+ constexpr VAddr SYSTEM_RESERVED_MIN = 0x7FFFFC000ULL;
+@@ -54,6 +68,7 @@ constexpr VAddr USER_MAX = 0xFFFFFFFFFFFULL;
+ #else
+ constexpr VAddr USER_MAX = 0x5FFFFFFFFFFFULL;
+ #endif
++#endif // ARCH_WASM
+ 
+ // Constants for the sizes of the ranges in address space.
+ static constexpr u64 SystemManagedSize = SYSTEM_MANAGED_MAX - SYSTEM_MANAGED_MIN + 1;
+@@ -626,6 +641,110 @@ struct AddressSpace::Impl {
+     u64 user_size{};
+     std::map<VAddr, MemoryRegion> regions;
+ };
++#elif defined(ARCH_WASM)
++
++enum WasmPageProtection { PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_EXECUTE_READWRITE };
++
++[[nodiscard]] constexpr WasmPageProtection ToPosixProt(Core::MemoryProt) {
++    // wasm linear memory has no page protection; every mapped page is readable and writable.
++    return PAGE_READWRITE;
++}
++
++// Guest memory lives at its own addresses inside wasm linear memory (core/wasm_layout.h). There is
++// no mmap: "mapping" means making sure linear memory extends far enough, and handing back
++// zero-filled bytes. What can't be expressed is aliasing - the same physical (direct memory)
++// pages visible at two virtual addresses at once - because linear memory has no way to make two
++// addresses refer to one byte. A second mapping of an already-mapped physical range gets a copy
++// of its current contents and a warning, instead of shared storage.
++struct AddressSpace::Impl {
++    Impl() {
++        system_managed_base = reinterpret_cast<u8*>(SYSTEM_MANAGED_MIN);
++        system_managed_size = SystemManagedSize;
++        system_reserved_base = reinterpret_cast<u8*>(SYSTEM_RESERVED_MIN);
++        system_reserved_size = SystemReservedSize;
++        user_base = reinterpret_cast<u8*>(USER_MIN);
++        user_size = UserSize;
++        if (emscripten_get_heap_size() < WasmLayout::HostBase) {
++            // Linked with -sGLOBAL_BASE=12GB, the emulator's own data starts above the guest
++            // window and initial memory already covers it; anything else means the build is
++            // misconfigured and guest mappings would overwrite the emulator.
++            LOG_CRITICAL(Kernel_Vmm, "wasm heap {:#x} does not cover the guest window",
++                         emscripten_get_heap_size());
++            throw std::bad_alloc{};
++        }
++        LOG_INFO(Kernel_Vmm, "System managed virtual memory region: {:#x} - {:#x}",
++                 SYSTEM_MANAGED_MIN, SYSTEM_MANAGED_MAX);
++        LOG_INFO(Kernel_Vmm, "System reserved virtual memory region: {:#x} - {:#x}",
++                 SYSTEM_RESERVED_MIN, SYSTEM_RESERVED_MAX);
++        LOG_INFO(Kernel_Vmm, "User virtual memory region: {:#x} - {:#x}", USER_MIN, USER_MAX);
++    }
++
++    void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, WasmPageProtection, int fd = -1) {
++        ASSERT_MSG(virtual_addr >= SYSTEM_MANAGED_MIN && virtual_addr + size <= USER_MAX + 1,
++                   "guest mapping {:#x}+{:#x} is outside the wasm guest window", virtual_addr,
++                   size);
++        u8* ptr = reinterpret_cast<u8*>(virtual_addr);
++        std::scoped_lock lk{mutex};
++        // Fresh linear memory is already zero; only ranges that have held a mapping before need
++        // clearing. Zeroing everything would touch (and so commit) every page of a large sparse
++        // mapping up front.
++        const auto range = boost::icl::interval<VAddr>::right_open(virtual_addr, virtual_addr + size);
++        for (const auto& used : dirty & range) {
++            std::memset(reinterpret_cast<void*>(used.lower()), 0, used.upper() - used.lower());
++        }
++        dirty += range;
++
++        if (fd != -1) {
++            // File mapping: copy the file contents in. Writes don't propagate back to the file.
++            u64 done = 0;
++            while (done < size) {
++                const ssize_t n = pread(fd, ptr + done, size - done, phys_addr + done);
++                if (n <= 0) {
++                    break;
++                }
++                done += static_cast<u64>(n);
++            }
++            return ptr;
++        }
++        if (phys_addr != static_cast<PAddr>(-1)) {
++            const auto alias = phys_mappings.find(phys_addr);
++            if (alias != phys_mappings.end() && alias->second != virtual_addr) {
++                if (alias_warnings++ < 16) {
++                    LOG_WARNING(Kernel_Vmm,
++                                "phys {:#x} already mapped at {:#x}; mapping it again at {:#x} "
++                                "gets a copy, not an alias (unsupported in wasm)",
++                                phys_addr, alias->second, virtual_addr);
++                }
++                std::memcpy(ptr, reinterpret_cast<const void*>(alias->second), size);
++            } else {
++                phys_mappings[phys_addr] = virtual_addr;
++            }
++        }
++        return ptr;
++    }
++
++    VAddr Unmap(VAddr virtual_addr, u64* size) {
++        std::scoped_lock lk{mutex};
++        std::erase_if(phys_mappings, [&](const auto& m) {
++            return m.second >= virtual_addr && m.second < virtual_addr + *size;
++        });
++        return virtual_addr;
++    }
++
++    void Protect(VAddr, u64, bool, bool, bool) {}
++
++    std::mutex mutex;
++    boost::icl::interval_set<VAddr> dirty;
++    std::map<PAddr, VAddr> phys_mappings;
++    u32 alias_warnings{};
++    u8* backing_base{};
++    u8* system_managed_base{};
++    u64 system_managed_size{};
++    u8* system_reserved_base{};
++    u64 system_reserved_size{};
++    u8* user_base{};
++    u64 user_size{};
++};
+ #else
+ 
+ enum PosixPageProtection {
+@@ -847,8 +966,14 @@ void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_e
+     if (phys_addr != -1 && std::bit_width(end_addr) <= Traits::ADDRESS_SPACE_BITS) {
+         const u64 base_page = virtual_addr >> Traits::PAGE_BITS;
+         for (u64 offset = 0; offset < size; offset += 16_KB) {
++#ifdef ARCH_WASM
++            // No separate backing store to point at: the guest pages are the storage.
++            backing_pages[base_page + (offset >> Traits::PAGE_BITS)] =
++                reinterpret_cast<u8*>(virtual_addr + offset);
++#else
+             backing_pages[base_page + (offset >> Traits::PAGE_BITS)] =
+                 backing_base + phys_addr + offset;
++#endif
+         }
+     }
+ #if ARCH_X86_64
+diff --git a/src/core/debug_state.cpp b/src/core/debug_state.cpp
+index 3d6ec64..604edac 100644
+--- a/src/core/debug_state.cpp
++++ b/src/core/debug_state.cpp
+@@ -12,7 +12,18 @@
+ #include "libraries/kernel/time.h"
+ #include "libraries/system/msgdialog.h"
+ #include "video_core/amdgpu/pm4_cmds.h"
++#include "common/arch.h"
++#ifdef ARCH_WASM
++// The wasm build has no Vulkan pipeline cache; this only names shaders for the debugger UI.
++namespace Vulkan::PipelineCache {
++template <typename Stage>
++std::string GetShaderName(Stage stage, u64 hash) {
++    return fmt::format("{}_{:#018x}", static_cast<int>(stage), hash);
++}
++} // namespace Vulkan::PipelineCache
++#else
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
++#endif
+ 
+ using namespace DebugStateType;
+ 
+diff --git a/src/core/libraries/audio/audioout.cpp b/src/core/libraries/audio/audioout.cpp
+index 92fcdbf..529fe2a 100644
+--- a/src/core/libraries/audio/audioout.cpp
++++ b/src/core/libraries/audio/audioout.cpp
+@@ -216,11 +216,16 @@ s32 PS4_SYSV_ABI sceAudioOutInit() {
+         return ORBIS_AUDIO_OUT_ERROR_ALREADY_INIT;
+     }
+ 
++#ifdef ARCH_WASM
++    // OpenAL isn't built for the browser; SDL's Emscripten audio backend drives Web Audio.
++    audio = std::make_unique<SDLAudioOut>();
++#else
+     if (EmulatorSettings.GetAudioBackend() == AudioBackend::OpenAL) {
+         audio = std::make_unique<OpenALAudioOut>();
+     } else {
+         audio = std::make_unique<SDLAudioOut>();
+     }
++#endif
+ 
+     LOG_INFO(Lib_AudioOut, "Audio system initialized");
+     return ORBIS_OK;
+diff --git a/src/core/libraries/ime/ime.cpp b/src/core/libraries/ime/ime.cpp
+index 2eb4171..8a12647 100644
+--- a/src/core/libraries/ime/ime.cpp
++++ b/src/core/libraries/ime/ime.cpp
+@@ -4,6 +4,7 @@
+ #include <algorithm>
+ #include <cstring>
+ #include <queue>
++#include "core/guest_call.h"
+ #include "common/logging/log.h"
+ #include "core/libraries/ime/ime.h"
+ #include "core/libraries/ime/ime_dialog.h"
+@@ -257,7 +258,7 @@ public:
+                 LOG_ERROR(Lib_Ime, "ImeHandler::Execute called with null IME callback");
+                 return;
+             }
+-            callback(param.arg, event);
++            Core::ExecuteGuest(callback, param.arg, event);
+         } else {
+             OrbisImeKeyboardParam param = m_param.key;
+             const OrbisImeEventHandler callback = use_param_handler ? param.handler : handler;
+@@ -265,7 +266,7 @@ public:
+                 LOG_ERROR(Lib_Ime, "ImeHandler::Execute called with null keyboard callback");
+                 return;
+             }
+-            callback(param.arg, event);
++            Core::ExecuteGuest(callback, param.arg, event);
+         }
+     }
+ 
+diff --git a/src/core/libraries/kernel/file_system.cpp b/src/core/libraries/kernel/file_system.cpp
+index e043cc4..17d5c68 100644
+--- a/src/core/libraries/kernel/file_system.cpp
++++ b/src/core/libraries/kernel/file_system.cpp
+@@ -40,7 +40,11 @@
+ #include "core/libraries/kernel/orbis_error.h"
+ #include "core/libraries/kernel/posix_error.h"
+ #include "core/libraries/libs.h"
++#ifndef ARCH_WASM
+ #include "core/libraries/net/net_kernel.h"
++#else
++#include "core/net/guest_net.h" // SelectEntry / poll bits only; no sockets exist in wasm
++#endif
+ #include "core/memory.h"
+ #include "kernel.h"
+ 
+@@ -381,7 +385,11 @@ s32 PS4_SYSV_ABI close(s32 fd) {
+         return -1;
+     }
+     if (file->type == Core::FileSys::FileType::Socket) {
++        #ifdef ARCH_WASM
++        return -1; // no sockets in the wasm build
++#else
+         return Libraries::Net::KernelClose(fd);
++#endif
+     }
+     ReleaseFlockState(file);
+     if (file->type == Core::FileSys::FileType::Regular) {
+@@ -421,7 +429,11 @@ s64 PS4_SYSV_ABI write(s32 fd, const void* buf, u64 nbytes) {
+     }
+ 
+     if (file->type == Core::FileSys::FileType::Socket) {
++        #ifdef ARCH_WASM
++        return -1; // no sockets in the wasm build
++#else
+         return Libraries::Net::KernelWrite(fd, buf, nbytes);
++#endif
+     }
+     std::scoped_lock lk{file->m_mutex};
+     if (file->type == Core::FileSys::FileType::Device) {
+@@ -706,7 +718,11 @@ s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
+     }
+ 
+     if (file->type == Core::FileSys::FileType::Socket) {
++        #ifdef ARCH_WASM
++        return -1; // no sockets in the wasm build
++#else
+         return Libraries::Net::KernelRead(fd, buf, nbytes);
++#endif
+     }
+     std::scoped_lock lk{file->m_mutex};
+     if (file->type == Core::FileSys::FileType::Device) {
+@@ -1084,7 +1100,11 @@ s32 PS4_SYSV_ABI fstat(s32 fd, OrbisKernelStat* sb) {
+         return result;
+     }
+     case Core::FileSys::FileType::Socket: {
++        #ifdef ARCH_WASM
++        return -1; // no sockets in the wasm build
++#else
+         return Libraries::Net::KernelFstat(fd, sb);
++#endif
+     }
+     case Core::FileSys::FileType::Equeue: {
+         LOG_ERROR(Kernel_Fs, "(STUBBED) file type {}", magic_enum::enum_name(file->type.load()));
+@@ -2167,7 +2187,11 @@ s32 PS4_SYSV_ABI posix_select(s32 nfds, GuestFdSet* readfds, GuestFdSet* writefd
+         timeout_us = 0;
+     }
+     if (!sockets.empty()) {
++#ifdef ARCH_WASM
++        const s64 n = -1;
++#else
+         const s64 n = Libraries::Net::KernelSelect(sockets, timeout_us);
++#endif
+         if (n < 0) {
+             return -1; // errno set
+         }
+diff --git a/src/core/libraries/kernel/kernel.cpp b/src/core/libraries/kernel/kernel.cpp
+index 735f7d7..2dc181c 100644
+--- a/src/core/libraries/kernel/kernel.cpp
++++ b/src/core/libraries/kernel/kernel.cpp
+@@ -27,8 +27,10 @@
+ #include "core/libraries/kernel/threads/pthread.h"
+ #include "core/libraries/kernel/time.h"
+ #include "core/libraries/libs.h"
++#ifndef ARCH_WASM
+ #include "core/libraries/net/net.h"
+ #include "core/libraries/net/net_kernel.h"
++#endif
+ 
+ #ifdef _WIN64
+ #include <Rpc.h>
+@@ -468,7 +470,9 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+     static char const** kernel_environ = g_environment;
+ 
+     // Before any socket exists: net ids are file descriptors from the kernel's table.
++#ifndef ARCH_WASM
+     Libraries::Net::InstallKernelIntegration();
++#endif
+ 
+     Libraries::Kernel::RegisterFileSystem(sym);
+     Libraries::Kernel::RegisterTime(sym);
+@@ -508,6 +512,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+     LIB_FUNCTION("mkawd0NA9ts", "libkernel", 1, "libkernel", posix_sysconf);
+     LIB_FUNCTION("mkawd0NA9ts", "libScePosix", 1, "libkernel", posix_sysconf);
+ 
++#ifndef ARCH_WASM // guest networking is not built for the browser (see PROJECT.md)
+     // network
+     LIB_FUNCTION("XVL8So3QJUk", "libkernel", 1, "libkernel", Libraries::Net::sys_connect);
+     LIB_FUNCTION("pG70GT5yRo4", "libkernel", 1, "libkernel", Libraries::Net::sys_socketex);
+@@ -547,6 +552,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+     LIB_FUNCTION("3e+4Iv7IJ8U", "libScePosix", 1, "libkernel", Libraries::Net::sys_accept);
+     LIB_FUNCTION("aNeavPDNKzA", "libScePosix", 1, "libkernel", Libraries::Net::sys_sendmsg);
+     LIB_FUNCTION("pxnCmagrtao", "libScePosix", 1, "libkernel", Libraries::Net::sys_listen);
++#endif
+ 
+     LIB_FUNCTION("4oXYe9Xmk0Q", "libkernel", 1, "libkernel", sceKernelGetGPI);
+     LIB_FUNCTION("ca7v6Cxulzs", "libkernel", 1, "libkernel", sceKernelSetGPO);
+diff --git a/src/core/libraries/kernel/memory.cpp b/src/core/libraries/kernel/memory.cpp
+index ba3d46a..3e46257 100644
+--- a/src/core/libraries/kernel/memory.cpp
++++ b/src/core/libraries/kernel/memory.cpp
+@@ -9,6 +9,10 @@
+ #endif
+ #include <fmt/format.h>
+ 
++#include "common/arch.h"
++#ifdef ARCH_WASM
++#include "core/wasm_layout.h"
++#endif
+ #include "common/alignment.h"
+ #include "common/assert.h"
+ #include "common/elf_info.h"
+@@ -380,7 +384,11 @@ s32 PS4_SYSV_ABI sceKernelMapNamedSystemFlexibleMemory(void** addr_in_out, u64 l
+     }
+ 
+     if (in_addr == 0) {
++#ifdef ARCH_WASM
++        in_addr = Core::WasmLayout::KernelFlexibleBase;
++#else
+         in_addr = 0x880000000;
++#endif
+     }
+     const auto mem_prot = static_cast<Core::MemoryProt>(prot);
+     auto* memory = Core::Memory::Instance();
+diff --git a/src/core/libraries/kernel/threads/exception.cpp b/src/core/libraries/kernel/threads/exception.cpp
+index 73d588f..cc48e2c 100644
+--- a/src/core/libraries/kernel/threads/exception.cpp
++++ b/src/core/libraries/kernel/threads/exception.cpp
+@@ -102,6 +102,7 @@ Ucontext::Ucontext(siginfo_t const* inf, ucontext_t* raw_context) {
+     uc_mcontext.mc_rip = regs[REG_RIP];
+     uc_mcontext.mc_addr = reinterpret_cast<uint64_t>(inf->si_addr);
+ #endif
++#elif defined(ARCH_WASM)
+ #else
+ #error "ucontext_t conversion not implemented for current architecture."
+ #endif
+@@ -225,6 +226,7 @@ void Ucontext::SyncHostFromGuest() {
+     // regs[REG_CSGSFS] |= (greg_t{uc_mcontext.mc_gs} << 16);
+     regs[REG_RIP] = uc_mcontext.mc_rip;
+ #endif
++#elif defined(ARCH_WASM)
+ #else
+ #error "ucontext_t conversion not implemented for current architecture."
+ #endif
+diff --git a/src/core/libraries/kernel/threads/mutex.cpp b/src/core/libraries/kernel/threads/mutex.cpp
+index 55eff12..afff9cd 100644
+--- a/src/core/libraries/kernel/threads/mutex.cpp
++++ b/src/core/libraries/kernel/threads/mutex.cpp
+@@ -25,6 +25,8 @@ static std::mutex MutxStaticLock;
+ #define CPU_SPINWAIT __asm__ volatile("pause")
+ #elif defined(ARCH_ARM64)
+ #define CPU_SPINWAIT __asm__ volatile("yield")
++#elif defined(ARCH_WASM)
++#define CPU_SPINWAIT std::atomic_signal_fence(std::memory_order_seq_cst)
+ #endif
+ 
+ #define CHECK_AND_INIT_MUTEX                                                                       \
+diff --git a/src/core/libraries/kernel/threads/pthread.cpp b/src/core/libraries/kernel/threads/pthread.cpp
+index 8ed90d2..0fb716c 100644
+--- a/src/core/libraries/kernel/threads/pthread.cpp
++++ b/src/core/libraries/kernel/threads/pthread.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "core/guest_call.h"
+ #include "common/assert.h"
+ #include "common/thread.h"
+ #ifdef _WIN32
+@@ -23,10 +24,19 @@
+ #include "core/libraries/libs.h"
+ #include "core/memory.h"
+ #include "core/signals.h"
++#ifdef ARCH_WASM
++#include "core/interpreter/guest.h"
++#endif
+ 
+ #if defined(ARCH_X86_64) || defined(__arm64__) || defined(__aarch64__)
+ extern "C" void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func,
+                                                  void* stackb) asm("_runOnAnotherStack");
++#elif defined(ARCH_WASM)
++// The stack is a guest stack; guest code on it runs in the interpreter.
++static void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func, void* stackb) {
++    return reinterpret_cast<void*>(Core::Interpreter::RunOnGuestStack(
++        reinterpret_cast<u64>(func), reinterpret_cast<u64>(arg), reinterpret_cast<u64>(stackb)));
++}
+ #else
+ void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func, void* stackb) {
+     UNREACHABLE_MSG("_runOnAnotherStack not implemented on target architecture.");
+@@ -104,7 +114,7 @@ void PS4_SYSV_ABI posix_pthread_exit(void* status) {
+     while (!curthread->cleanup.empty()) {
+         PthreadCleanup* old = curthread->cleanup.front();
+         curthread->cleanup.pop_front();
+-        old->routine(old->routine_arg);
++        Core::ExecuteGuest(old->routine, old->routine_arg);
+         if (old->onheap) {
+             delete old;
+         }
+@@ -467,7 +477,7 @@ int PS4_SYSV_ABI posix_pthread_once(PthreadOnce* once_control,
+ 
+     PthreadCleanup cup{once_cancel_handler, once_control, 0};
+     g_curthread->cleanup.push_front(&cup);
+-    init_routine();
++    Core::ExecuteGuest(init_routine);
+     g_curthread->cleanup.pop_front();
+ 
+     auto state = PthreadOnceState::InProgress;
+@@ -995,12 +1005,12 @@ static void PS4_SYSV_ABI CallbackWrapper(void* arg) {
+     if (a.action->sa_flags & POSIX_SA_SIGINFO) {
+         auto sigaction_handler = a.action->__sigaction_handler.sigaction;
+         if (sigaction_handler != nullptr) {
+-            sigaction_handler(a.sig, a.info, a.context);
++            Core::ExecuteGuest(sigaction_handler, a.sig, a.info, a.context);
+         }
+     } else {
+         auto signal_handler = a.action->__sigaction_handler.handler;
+         if (signal_handler != nullptr) {
+-            signal_handler(a.sig);
++            Core::ExecuteGuest(signal_handler, a.sig);
+         }
+     }
+ }
+diff --git a/src/core/libraries/kernel/threads/pthread_clean.cpp b/src/core/libraries/kernel/threads/pthread_clean.cpp
+index 45a134b..ee2da61 100644
+--- a/src/core/libraries/kernel/threads/pthread_clean.cpp
++++ b/src/core/libraries/kernel/threads/pthread_clean.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "core/guest_call.h"
+ #include "core/libraries/kernel/threads/pthread.h"
+ #include "core/libraries/libs.h"
+ 
+@@ -33,7 +34,7 @@ void PS4_SYSV_ABI posix_pthread_cleanup_pop(int execute) {
+         PthreadCleanup* old = curthread->cleanup.front();
+         curthread->cleanup.pop_front();
+         if (execute) {
+-            old->routine(old->routine_arg);
++            Core::ExecuteGuest(old->routine, old->routine_arg);
+         }
+         if (old->onheap) {
+             delete old;
+diff --git a/src/core/libraries/kernel/threads/pthread_spec.cpp b/src/core/libraries/kernel/threads/pthread_spec.cpp
+index b0e0984..89f884b 100644
+--- a/src/core/libraries/kernel/threads/pthread_spec.cpp
++++ b/src/core/libraries/kernel/threads/pthread_spec.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "core/guest_call.h"
+ #include "core/libraries/kernel/kernel.h"
+ #include "core/libraries/kernel/posix_error.h"
+ #include "core/libraries/kernel/threads/pthread.h"
+@@ -85,7 +86,7 @@ void _thread_cleanupspecific() {
+                  * destructor:
+                  */
+                 lk.unlock();
+-                destructor(data);
++                Core::ExecuteGuest(destructor, data);
+                 lk.lock();
+             }
+         }
+diff --git a/src/core/libraries/kernel/threads/stack.cpp b/src/core/libraries/kernel/threads/stack.cpp
+index 8c031e9..a52481b 100644
+--- a/src/core/libraries/kernel/threads/stack.cpp
++++ b/src/core/libraries/kernel/threads/stack.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/arch.h"
++#ifdef ARCH_WASM
++#include "core/wasm_layout.h"
++#endif
+ #include "common/assert.h"
+ #include "core/libraries/kernel/threads/pthread.h"
+ #include "core/libraries/kernel/threads/thread_state.h"
+@@ -77,7 +81,11 @@ int ThreadState::CreateStack(PthreadAttr* attr) {
+ 
+     /* Allocate a stack from usrstack. */
+     if (last_stack == 0) {
++#ifdef ARCH_WASM
++        static constexpr VAddr UsrStack = Core::WasmLayout::UsrStack;
++#else
+         static constexpr VAddr UsrStack = 0x7EFFF8000ULL;
++#endif
+         last_stack = UsrStack - ThrStackInitial - ThrGuardDefault;
+     }
+ 
+diff --git a/src/core/libraries/libs.cpp b/src/core/libraries/libs.cpp
+index f57173d..3a87c51 100644
+--- a/src/core/libraries/libs.cpp
++++ b/src/core/libraries/libs.cpp
+@@ -72,8 +72,10 @@
+ #include "core/libraries/system/systemservice.h"
+ #include "core/libraries/system/userservice.h"
+ #include "core/libraries/ulobjmgr/ulobjmgr.h"
++#ifndef ARCH_WASM // libusb has no browser equivalent (WebUSB would need its own backend)
+ #include "core/libraries/usbd/usbd.h"
+ #include "core/libraries/usbd/usbstorage.h"
++#endif
+ #include "core/libraries/video_recording/video_recording.h"
+ #include "core/libraries/videodec/vdeccore.h"
+ #include "core/libraries/videodec/vdecsw.h"
+@@ -160,8 +162,10 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
+             {"libScePlayGo.sprx", Libraries::PlayGo::RegisterLib},
+             {"libScePlayGoDialog.sprx", Libraries::PlayGo::Dialog::RegisterLib},
+             {"libSceRandom.sprx", Libraries::Random::RegisterLib},
++#ifndef ARCH_WASM
+             {"libSceUsbd.sprx", Libraries::Usbd::RegisterLib},
+             {"libSceUsbStorage.sprx", Libraries::UsbStorage::RegisterLib},
++#endif
+             {"libSceMusicPlayerService.sprx", Libraries::MusicPlayerService::RegisterLib},
+             {"libSceAjm.sprx", Libraries::Ajm::RegisterLib},
+             {"libSceErrorDialog.sprx", Libraries::ErrorDialog::RegisterLib},
+diff --git a/src/core/libraries/net/net_upnp.h b/src/core/libraries/net/net_upnp.h
+index 6d9fcc7..2aacded 100644
+--- a/src/core/libraries/net/net_upnp.h
++++ b/src/core/libraries/net/net_upnp.h
+@@ -8,10 +8,13 @@
+ #include <mutex>
+ #include <string>
+ #include <thread>
++#include "common/arch.h"
+ #include "common/types.h"
+ 
++#ifndef ARCH_WASM
+ #include <miniupnpc.h>
+ #include <upnpcommands.h>
++#endif
+ 
+ namespace Libraries::Net {
+ 
+@@ -64,8 +67,10 @@ private:
+     char m_external_ip_str[16]{};
+ 
+     char m_lan_addr[64]{};
++#ifndef ARCH_WASM // no UDP multicast or raw sockets in a browser; see web/net_upnp_web.cpp
+     UPNPUrls m_urls{};
+     IGDdatas m_data{};
++#endif
+ 
+     std::mutex m_mutex;
+     std::condition_variable m_cv;
+diff --git a/src/core/libraries/net/net_util.cpp b/src/core/libraries/net/net_util.cpp
+index 24d3755..2608236 100644
+--- a/src/core/libraries/net/net_util.cpp
++++ b/src/core/libraries/net/net_util.cpp
+@@ -1,6 +1,9 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <fstream>
++#include <sstream>
++
+ #ifdef _WIN32
+ #define _WINSOCK_DEPRECATED_NO_WARNINGS
+ #include <Ws2tcpip.h>
+diff --git a/src/core/libraries/save_data/savedata.cpp b/src/core/libraries/save_data/savedata.cpp
+index f70e329..52b3d20 100644
+--- a/src/core/libraries/save_data/savedata.cpp
++++ b/src/core/libraries/save_data/savedata.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <magic_enum/magic_enum.hpp>
+ 
++#include "core/guest_call.h"
+ #include "common/assert.h"
+ #include "common/cstring.h"
+ #include "common/elf_info.h"
+@@ -335,7 +336,7 @@ void DispatchBackupEvent(const Backup::BackupRequest& request) {
+     SCOPE_EXIT {
+         g_in_backup_callback = was_in_callback;
+     };
+-    g_event_callback(&event, g_event_userdata);
++    Core::ExecuteGuest(g_event_callback, &event, g_event_userdata);
+ }
+ 
+ static bool g_initialized = false;
+diff --git a/src/core/libraries/system/userservice.cpp b/src/core/libraries/system/userservice.cpp
+index 9a50825..85ef4f7 100644
+--- a/src/core/libraries/system/userservice.cpp
++++ b/src/core/libraries/system/userservice.cpp
+@@ -10,8 +10,10 @@
+ #include "common/singleton.h"
+ #include "core/emulator_settings.h"
+ #include "core/libraries/libs.h"
++#ifndef ARCH_WASM
+ #include "core/libraries/np/np_handler/np_handler.h"
+ #include "core/libraries/np/np_manager.h"
++#endif
+ #include "core/libraries/system/userservice.h"
+ #include "core/libraries/system/userservice_error.h"
+ #include "core/tls.h"
+@@ -131,7 +133,9 @@ s32 PS4_SYSV_ABI sceUserServiceGetEvent(OrbisUserServiceEvent* event) {
+         event->event = temp.event;
+         event->userId = temp.userId;
+         user_service_event_queue.pop();
++#ifndef ARCH_WASM
+         Libraries::Np::NpManager::NotifyNpStateFromUserServiceEvent(temp.event, temp.userId);
++#endif
+         LOG_INFO(Lib_UserService, "Event processed by the game: {} {}", (u8)temp.event,
+                  temp.userId);
+         return ORBIS_OK;
+@@ -1113,6 +1117,7 @@ s32 PS4_SYSV_ABI sceUserServiceGetUserName(int user_id, char* user_name, std::si
+     } else {
+         LOG_ERROR(Lib_UserService, "No user found");
+     }
++#ifndef ARCH_WASM // no shadNet sign-in in the browser build
+     // once signed in shadnet onlineid is set as username
+     if (g_shadnet_enabled && Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+         const auto np_id = Libraries::Np::NpHandler::GetInstance().GetNpId(user_id);
+@@ -1121,6 +1126,7 @@ s32 PS4_SYSV_ABI sceUserServiceGetUserName(int user_id, char* user_name, std::si
+             name.assign(np_id.handle.data, handle_len);
+         }
+     }
++#endif
+ 
+     if (size < name.length() + 1) {
+         LOG_ERROR(Lib_UserService, "buffer is too short");
+diff --git a/src/core/linker.cpp b/src/core/linker.cpp
+index 44d216d..cb9e4c8 100644
+--- a/src/core/linker.cpp
++++ b/src/core/linker.cpp
+@@ -1,6 +1,10 @@
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/arch.h"
++#ifdef ARCH_WASM
++#include "core/wasm_layout.h"
++#endif
+ #include "common/alignment.h"
+ #include "common/arch.h"
+ #include "common/assert.h"
+@@ -23,10 +27,13 @@
+ #include "core/libraries/libc_internal/libc_internal.h"
+ #include "core/libraries/sysmodule/sysmodule.h"
+ #include "core/libraries/sysmodule/sysmodule_internal.h"
++#include "core/guest_call.h"
+ #include "core/linker.h"
+ #include "core/memory.h"
+ #include "core/tls.h"
++#ifndef ARCH_WASM
+ #include "ipc/ipc.h"
++#endif
+ 
+ #ifndef _WIN32
+ #include <signal.h>
+@@ -59,6 +66,11 @@ static PS4_SYSV_ABI void* RunMainEntry [[noreturn]](EntryParams* params) {
+                  : "r"(params->entry_addr), "r"(params), "r"(ProgramExitFunc)
+                  : "rax", "rsi", "rdi");
+     UNREACHABLE();
++#elif defined(ARCH_WASM)
++    // Same stack layout as the asm above, set up on an interpreted guest stack. EntryParams and
++    // argv stay where they are: guest addresses are host addresses in the wasm build too.
++    Core::Interpreter::RunMainEntry(params->entry_addr, reinterpret_cast<u64>(params),
++                                    reinterpret_cast<u64>(HOST_CALL(ProgramExitFunc)));
+ #else
+     UNREACHABLE_MSG("RunMainEntry unimplemented for current architecture.");
+ #endif
+@@ -154,9 +166,11 @@ void Linker::Execute(const std::vector<std::string>& args) {
+         sigemptyset(&emptyset);
+         pthread_sigmask(SIG_SETMASK, &emptyset, nullptr);
+ #endif
++#ifndef ARCH_WASM
+         if (auto& ipc = IPC::Instance()) {
+             ipc.WaitForStart();
+         }
++#endif
+ 
+         // Load libSceLibcInternal, run malloc_init.
+         if (has_libcinternal) {
+@@ -164,9 +178,9 @@ void Linker::Execute(const std::vector<std::string>& args) {
+ 
+             if (malloc_init && sceLibcInternalMemoryMutexEnable) {
+                 // Call _malloc_init
+-                s32 ret = malloc_init();
++                s32 ret = Core::ExecuteGuest(malloc_init);
+                 ASSERT_MSG(ret == 0, "malloc_init failed");
+-                sceLibcInternalMemoryMutexEnable();
++                Core::ExecuteGuest(sceLibcInternalMemoryMutexEnable);
+             }
+         }
+ 
+@@ -197,7 +211,11 @@ void Linker::Execute(const std::vector<std::string>& args) {
+         s32 result = Libraries::Kernel::sceKernelAllocateDirectMemory(
+             0, Libraries::Kernel::sceKernelGetDirectMemorySize(), 0x10000, 0x10000, 3, &phys_addr);
+         if (result == 0) {
++#ifdef ARCH_WASM
++            void* addr{reinterpret_cast<void*>(Core::WasmLayout::GnmDriverBase)};
++#else
+             void* addr{reinterpret_cast<void*>(0xfe0000000)};
++#endif
+             result = Libraries::Kernel::sceKernelMapNamedDirectMemory(
+                 &addr, 0x10000, 0x13, 0, phys_addr, 0x10000, "SceGnmDriver");
+         }
+@@ -249,7 +267,9 @@ s32 Linker::LoadModule(const std::filesystem::path& elf_name, bool is_dynamic) {
+     num_static_modules += !is_dynamic;
+     m_modules.emplace_back(std::move(module));
+ 
++#ifndef ARCH_WASM
+     Core::Devtools::Widget::ModuleList::AddModule(elf_name.filename().string(), elf_name);
++#endif
+ 
+     return mod_id;
+ }
+@@ -491,7 +511,7 @@ void* Linker::TlsGetAddr(u64 module_index, u64 offset) {
+         const u32 init_image_size = module->tls.init_image_size;
+         u8* dest{};
+         if (heap_api && heap_api->heap_malloc) {
+-            dest = reinterpret_cast<u8*>(heap_api->heap_malloc(module->tls.image_size));
++            dest = reinterpret_cast<u8*>(Core::ExecuteGuest(heap_api->heap_malloc, module->tls.image_size));
+         } else {
+             dest = reinterpret_cast<u8*>(std::malloc(module->tls.image_size));
+         }
+@@ -512,7 +532,11 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
+     // If sceKernelMapNamedFlexibleMemory is being called from libkernel and addr = 0
+     // it automatically places mappings in system reserved area instead of managed.
+     // Since the system reserved area already has a mapping in it, this address is slightly higher.
++#ifdef ARCH_WASM
++    static constexpr VAddr KernelAllocBase = Core::WasmLayout::KernelTlsAllocBase;
++#else
+     static constexpr VAddr KernelAllocBase = 0x881000000ULL;
++#endif
+ 
+     // The kernel module has a few different paths for TLS allocation.
+     // For SDK < 1.7 it allocates both main and secondary thread blocks using libc mspace/malloc.
+@@ -526,7 +550,7 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
+         ASSERT_MSG(ret == 0, "Unable to allocate TLS+TCB for the primary thread");
+     } else {
+         if (heap_api && heap_api->heap_malloc) {
+-            addr_out = heap_api->heap_malloc(total_tls_size);
++            addr_out = Core::ExecuteGuest(heap_api->heap_malloc, total_tls_size);
+         } else {
+             addr_out = std::malloc(total_tls_size);
+         }
+@@ -536,7 +560,7 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
+ 
+ void Linker::FreeTlsForNonPrimaryThread(void* pointer) {
+     if (heap_api && heap_api->heap_free) {
+-        heap_api->heap_free(pointer);
++        Core::ExecuteGuest(heap_api->heap_free, pointer);
+     } else {
+         std::free(pointer);
+     }
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index b05d329..c7dd371 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -193,7 +193,13 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+             }
+             const u64 start_in_dma =
+                 std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
++#ifdef ARCH_WASM
++            // No separate backing store in wasm (see core/address_space.cpp): write the guest
++            // pages themselves, which have no protection to bypass anyway.
++            u8* backing = reinterpret_cast<u8*>(vma.base + std::max<u64>(start_in_vma, phys_handle->first));
++#else
+             u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
++#endif
+             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
+             memcpy(backing, data, copy_size);
+             data = static_cast<const u8*>(data) + copy_size;
+@@ -974,8 +980,10 @@ u64 MemoryManager::UnmapBytesFromEntry(VAddr virtual_addr, VirtualMemoryArea vma
+                 MergeAdjacent(fmem_map, new_fmem_handle);
+ 
+                 // Zero out the old memory data
++#ifndef ARCH_WASM // AddressSpace zeroes a range when it is next mapped instead
+                 const auto unmap_hardware_address = impl.BackingBase() + phys_addr;
+                 std::memset(unmap_hardware_address, 0, size_in_dma);
++#endif
+ 
+                 // Update flexible usage
+                 flexible_usage -= size_in_dma;
+diff --git a/src/core/module.cpp b/src/core/module.cpp
+index c721f5b..250c5f7 100644
+--- a/src/core/module.cpp
++++ b/src/core/module.cpp
+@@ -14,6 +14,11 @@
+ #include "core/libraries/error_codes.h"
+ #include "core/loader/dwarf.h"
+ #include "core/memory.h"
++#include "common/arch.h"
++#ifdef ARCH_WASM
++#include "core/wasm_layout.h"
++#endif
++#include "core/guest_call.h"
+ #include "core/module.h"
+ #include "core/tls.h"
+ 
+@@ -23,7 +28,11 @@ using EntryFunc = PS4_SYSV_ABI int (*)(size_t args, const void* argp, void* para
+ 
+ static constexpr u64 ExecutableLoadBase = 0x400000;
+ static constexpr u64 GameModuleLoadBase = 0x80000000;
++#ifdef ARCH_WASM
++static constexpr u64 SystemModuleLoadBase = Core::WasmLayout::SystemModuleLoadBase;
++#else
+ static constexpr u64 SystemModuleLoadBase = 0x800000000;
++#endif
+ 
+ static u64 GetAlignedSize(const elf_program_header& phdr) {
+     return (phdr.p_align != 0 ? (phdr.p_memsz + (phdr.p_align - 1)) & ~(phdr.p_align - 1)
+@@ -102,7 +111,7 @@ Module::~Module() = default;
+ s32 Module::Start(u64 args, const void* argp, void* param) {
+     LOG_INFO(Core_Linker, "Module started : {}", name);
+     const VAddr addr = dynamic_info.init_virtual_addr + GetBaseAddress();
+-    return reinterpret_cast<EntryFunc>(addr)(args, argp, param);
++    return Core::ExecuteGuest(reinterpret_cast<EntryFunc>(addr), args, argp, param);
+ }
+ 
+ void Module::LoadModuleToMemory(u32& max_tls_index) {
+diff --git a/src/core/thread.cpp b/src/core/thread.cpp
+index e58f16e..a262baf 100644
+--- a/src/core/thread.cpp
++++ b/src/core/thread.cpp
+@@ -75,6 +75,7 @@ void NativeThread::Initialize() {
+ #else
+     tid = (u64)pthread_self();
+ 
++#ifndef ARCH_WASM // guest faults are raised by the interpreter, not delivered as host signals
+     // Set up an alternate signal handler stack to avoid overflowing small thread stacks.
+     const size_t page_size = getpagesize();
+     const size_t sig_stack_size = Common::AlignUp(std::max<size_t>(64_KB, MINSIGSTKSZ), page_size);
+@@ -87,6 +88,7 @@ void NativeThread::Initialize() {
+     sig_stack.ss_flags = 0;
+     ASSERT_MSG(sigaltstack(&sig_stack, nullptr) == 0, "Failed to set signal stack: {}", errno);
+ #endif
++#endif
+ }
+ 
+ } // namespace Core
+diff --git a/src/core/tls.cpp b/src/core/tls.cpp
+index 3960cd9..359c20f 100644
+--- a/src/core/tls.cpp
++++ b/src/core/tls.cpp
+@@ -6,6 +6,9 @@
+ #include "common/assert.h"
+ #include "core/libraries/kernel/threads/pthread.h"
+ #include "core/tls.h"
++#ifdef ARCH_WASM
++#include "core/interpreter/cpu.h"
++#endif
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -204,6 +207,9 @@ pthread_key_t GetTcbKey() {
+ 
+ void SetTcbBase(void* image_address) {
+     ASSERT(pthread_setspecific(GetTcbKey(), image_address) == 0);
++#ifdef ARCH_WASM
++    Core::Interpreter::Cpu::Current().State().fs_base = reinterpret_cast<u64>(image_address);
++#endif
+ }
+ 
+ Tcb* GetTcbBase() {
+diff --git a/src/core/tls.h b/src/core/tls.h
+index 37f788d..a67afa5 100644
+--- a/src/core/tls.h
++++ b/src/core/tls.h
+@@ -4,7 +4,11 @@
+ #pragma once
+ 
+ #include <cstring>
++#include "common/arch.h"
+ #include "common/types.h"
++#ifdef ARCH_WASM
++#include "core/interpreter/hle.h"
++#endif
+ #ifdef _WIN32
+ #include <malloc.h>
+ #endif
+@@ -57,6 +61,12 @@ struct HostCallWrapperImpl<func> {
+     }
+ };
+ 
++#ifdef ARCH_WASM
++// Host functions have no x86 address for guest code to call; the interpreter gives each one a
++// synthetic address and marshals the guest's registers into a real C++ call (interpreter/hle.h).
++#define HOST_CALL(func) (Core::Interpreter::HleAddress<func>())
++#else
+ #define HOST_CALL(func) (Core::HostCallWrapperImpl<func>::wrap)
++#endif
+ 
+ } // namespace Core
+diff --git a/src/emulator.cpp b/src/emulator.cpp
+index 072a1cf..5ffb1a2 100644
+--- a/src/emulator.cpp
++++ b/src/emulator.cpp
+@@ -10,14 +10,19 @@
+ #include <sstream>
+ #include <fmt/core.h>
+ #include <fmt/xchar.h>
++#include "common/arch.h"
++#ifndef ARCH_WASM
+ #include <hwinfo/hwinfo.h>
++#endif
+ 
+ #include "common/debug.h"
+ #include "common/logging/log.h"
+ #include "common/string_util.h"
+ #include "common/thread.h"
+ #include "core/emulator_settings.h"
++#ifndef ARCH_WASM
+ #include "core/ipc/ipc.h"
++#endif
+ #ifdef ENABLE_DISCORD_RPC
+ #include "common/discord_rpc_handler.h"
+ #endif
+@@ -29,8 +34,10 @@
+ #include "common/scm_rev.h"
+ #include "common/singleton.h"
+ #include "core/cpu_patches.h" // Windows static guest red-zone protection
++#ifndef ARCH_WASM
+ #include "core/debugger.h"
+ #include "core/devtools/widget/module_list.h"
++#endif
+ #include "core/emulator_settings.h"
+ #include "core/emulator_state.h"
+ #include "core/file_format/psf.h"
+@@ -39,10 +46,14 @@
+ #include "core/libraries/kernel/kernel.h"
+ #include "core/libraries/libs.h"
+ #include "core/libraries/net/net_discovery.h"
++#ifndef ARCH_WASM
+ #include "core/libraries/np/np_handler/np_handler.h"
++#endif
+ #include "core/libraries/np/np_trophy.h"
+ #include "core/libraries/save_data/save_backup.h"
++#ifndef ARCH_WASM
+ #include "core/libraries/usbd/usbstorage.h"
++#endif
+ #include "core/linker.h"
+ #include "core/memory.h"
+ #include "core/user_settings.h"
+@@ -284,9 +295,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+                    std::vector<std::pair<std::filesystem::path, std::string>> mounts,
+                    std::vector<std::string> const& env_vars, bool append_log) {
+     Common::SetCurrentThreadName("shadPS4:Main");
++#ifndef ARCH_WASM
+     if (waitForDebuggerBeforeRun) {
+         Debugger::WaitForDebuggerAttach();
+     }
++#endif
+ 
+     if (std::filesystem::is_directory(file)) {
+         file /= "eboot.bin";
+@@ -513,6 +526,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+     LOG_INFO(Config, "Vulkan PipelineCacheArchived: {}",
+              EmulatorSettings.IsPipelineCacheArchived());
+ 
++#ifdef ARCH_WASM
++    LOG_INFO(Config, "CPU Model: x86-64 interpreter (WebAssembly host, {} worker threads)",
++             std::thread::hardware_concurrency());
++    LOG_INFO(Config, "Operating System: WebAssembly (Emscripten)");
++#else
+     hwinfo::Memory ram;
+     hwinfo::OS os;
+     const auto cpus = hwinfo::getAllCPUs();
+@@ -523,6 +541,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+     }
+     LOG_INFO(Config, "Total RAM: {} GB", std::round(ram.total_Bytes() / pow(1024, 3)));
+     LOG_INFO(Config, "Operating System: {}", os.name());
++#endif
+ 
+     if (param_sfo_exists) {
+         LOG_INFO(Loader, "Game id: {} Title: {}", id, title);
+@@ -625,10 +644,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+     }
+     mnt->Mount(mount_download_dir, "/download0");
+ 
++#ifndef ARCH_WASM
+     const auto mount_usb_dir = Libraries::UsbStorage::GetUsbMountPath();
+     std::error_code ec_usb;
+     std::filesystem::create_directories(mount_usb_dir, ec_usb);
+     mnt->Mount(mount_usb_dir, "/mnt/usb0");
++#endif
+ 
+     const auto& mount_captures_dir = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
+     if (!std::filesystem::exists(mount_captures_dir)) {
+@@ -696,9 +717,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
+     }
+ #endif
+ 
++#ifndef ARCH_WASM
+     if (EmulatorSettings.IsConnectedToNetwork() && EmulatorSettings.IsDeviceDiscoveryEnabled()) {
+         Libraries::Net::DiscoveryResponder::Instance().Start();
+     }
++#endif
+ 
+     if (!id.empty()) {
+         start_time = std::chrono::steady_clock::now();
+@@ -783,6 +806,13 @@ void Emulator::Restart(std::filesystem::path eboot_path,
+ }
+ 
+ [[noreturn]] void Emulator::Relaunch(std::vector<std::string> args) {
++#ifdef ARCH_WASM
++    // A browser tab can't spawn a second copy of itself; the page reloads instead.
++    LOG_CRITICAL(Common, "Relaunch requested ({}) - not supported in the browser build",
++                 fmt::join(args, " "));
++    Common::Log::Shutdown();
++    std::quick_exit(0);
++#else
+     const auto guest_args = std::find(args.begin(), args.end(), "--");
+     args.insert(guest_args, {"--wait-for-pid", std::to_string(Debugger::GetCurrentPid())});
+ 
+@@ -849,6 +879,7 @@ void Emulator::Restart(std::filesystem::path eboot_path,
+ #endif
+ 
+     std::quick_exit(0);
++#endif // ARCH_WASM
+ }
+ 
+ void Emulator::UpdatePlayTime(const std::string_view serial) {
+diff --git a/src/video_core/renderer_vulkan/vk_presenter.h b/src/video_core/renderer_vulkan/vk_presenter.h
+index 946e522..8442c0a 100644
+--- a/src/video_core/renderer_vulkan/vk_presenter.h
++++ b/src/video_core/renderer_vulkan/vk_presenter.h
+@@ -3,6 +3,12 @@
+ 
+ #pragma once
+ 
++#include "common/arch.h"
++#ifdef ARCH_WASM
++// No Vulkan in the browser; see video_core/renderer_web/web_presenter.h.
++#include "video_core/renderer_web/web_presenter.h"
++#else
++
+ #include <condition_variable>
+ 
+ #include "core/libraries/videoout/buffer.h"
+@@ -139,3 +145,5 @@ private:
+ };
+ 
+ } // namespace Vulkan
++
++#endif // ARCH_WASM
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index e01715c..a0d9ec1 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -3,6 +3,12 @@
+ 
+ #pragma once
+ 
++#include "common/arch.h"
++#ifdef ARCH_WASM
++// No Vulkan in the browser; see video_core/renderer_web/web_rasterizer.h.
++#include "video_core/renderer_web/web_rasterizer.h"
++#else
++
+ #include "common/recursive_lock.h"
+ #include "common/shared_first_mutex.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+@@ -178,3 +184,5 @@ private:
+ };
+ 
+ } // namespace Vulkan
++
++#endif // ARCH_WASM

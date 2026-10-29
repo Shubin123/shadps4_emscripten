@@ -1,265 +1,129 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Hand-assembled x86-64 machine code exercising Core::Interpreter, run with a plain native
-// compiler (no Emscripten, no shadPS4 build required - see CMakeLists.txt in this directory).
-// Every byte sequence below is commented with the instruction it encodes; this is deliberately
-// not using an external assembler so there is no second tool whose own correctness this would
-// need to trust.
+// Tests for the wasm build's x86-64 interpreter (patches/new_files/core/interpreter), run as a
+// wasm64 program under Node with the same memory layout as the emulator. The guest functions are
+// real assembler output (guest_code.s -> guest_code.inc via gen_guest_code.sh), not hand-encoded
+// bytes, so what's being checked is the interpreter's semantics rather than the test's encoding.
 
+#include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <stdexcept>
-#include <vector>
-#include "core/interpreter/guest_address_space.h"
-#include "core/interpreter/guest_memory.h"
-#include "core/interpreter/host_thunk.h"
-#include "core/interpreter/x86_interpreter.h"
+#include "core/interpreter/cpu.h"
+#include "core/interpreter/guest.h"
+#include "core/interpreter/hle.h"
+
+#include "guest_code.inc"
 
 using namespace Core::Interpreter;
 
 namespace {
 
-int g_failures = 0;
+int failures = 0;
+int checks = 0;
 
-void Check(bool condition, const char* what) {
-    if (!condition) {
-        std::fprintf(stderr, "FAIL: %s\n", what);
-        g_failures++;
-    } else {
-        std::fprintf(stderr, "ok:   %s\n", what);
+void Check(bool ok, const char* what) {
+    checks++;
+    if (!ok) {
+        failures++;
     }
+    std::fprintf(stderr, "%s %s\n", ok ? "ok  " : "FAIL", what);
 }
 
-// A flat buffer standing in for guest memory: VAddr is just an offset into it. Nowhere near
-// what the real integration needs (see PROJECT.md, "Guest virtual memory") - this exists only
-// to exercise the interpreter's instruction semantics and call-boundary mechanics in isolation.
-class FlatGuestMemory final : public GuestMemory {
-public:
-    explicit FlatGuestMemory(std::size_t size) : bytes(size, 0) {}
+// Guest code and data live at fixed guest addresses inside the wasm guest window
+// (core/wasm_layout.h); guest addresses are host addresses, so plain pointers work.
+constexpr u64 kCode = 0x10000000;
+constexpr u64 kData = 0x10100000;
 
-    std::uint8_t* Translate(VAddr vaddr, std::size_t size, bool /*for_write*/) override {
-        if (vaddr + size > bytes.size()) {
-            std::fprintf(stderr, "FlatGuestMemory: out-of-range access at %#llx (+%zu)\n",
-                          static_cast<unsigned long long>(vaddr), size);
-            std::abort();
-        }
-        return bytes.data() + vaddr;
-    }
-
-    void LoadCode(VAddr at, std::initializer_list<std::uint8_t> code) {
-        std::size_t i = 0;
-        for (std::uint8_t b : code) {
-            bytes[at + i] = b;
-            ++i;
-        }
-    }
-
-private:
-    std::vector<std::uint8_t> bytes;
-};
-
-// --- Test A: SysV calling convention + basic ALU --------------------------------------------
-// mov eax, edi ; add eax, esi ; ret        -- computes edi + esi
-void TestAddFunction() {
-    FlatGuestMemory mem(0x10000);
-    HostThunkTable thunks;
-    X86Interpreter cpu(mem, thunks);
-    constexpr VAddr kCode = 0x1000;
-    mem.LoadCode(kCode,
-                 {0x89, 0xF8,             // mov eax, edi
-                  0x01, 0xF0,             // add eax, esi
-                  0xC3});                 // ret
-    cpu.State().Reg(Gpr::Rsp) = 0x8000;
-    const std::uint64_t result = cpu.CallGuestFunction(kCode, {3, 4});
-    Check(result == 7, "TestAddFunction: 3 + 4 == 7");
+u64 Fn(u64 offset) {
+    return kCode + offset;
 }
 
-// --- Test B: control flow (loop with a conditional branch) ------------------------------------
-// Computes the triangular number sum(1..n) for n = rdi, using a counting loop with CMP/JGE/
-// INC/ADD/JMP. See the design notes for the byte-by-byte derivation; summarized inline below.
-void TestLoopTriangularNumber() {
-    FlatGuestMemory mem(0x10000);
-    HostThunkTable thunks;
-    X86Interpreter cpu(mem, thunks);
-    constexpr VAddr kCode = 0x1000;
-    mem.LoadCode(kCode,
-                 {0x31, 0xC0,             // xor eax, eax        ; eax = 0 (accumulator)
-                  0x31, 0xC9,             // xor ecx, ecx        ; ecx = 0 (counter i)
-                  0x39, 0xF9,             // cmp ecx, edi        ; loop: i vs n
-                  0x7D, 0x06,             // jge +6              ; if i >= n, done (-> offset 14)
-                  0xFF, 0xC1,             // inc ecx             ; i++
-                  0x01, 0xC8,             // add eax, ecx        ; sum += i
-                  0xEB, 0xF6,             // jmp -10             ; back to the cmp at offset 4
-                  0xC3});                 // ret                 ; done (offset 14)
-    cpu.State().Reg(Gpr::Rsp) = 0x8000;
-    const std::uint64_t result = cpu.CallGuestFunction(kCode, {5});
-    Check(result == 15, "TestLoopTriangularNumber: sum(1..5) == 15");
-}
-
-// --- Test C: flags + SETcc + MOVZX --------------------------------------------------------------
-// cmp edi, esi ; sete al ; movzx eax, al ; ret   -- returns 1 if edi == esi, else 0
-void TestCompareEqual() {
-    FlatGuestMemory mem(0x10000);
-    HostThunkTable thunks;
-    X86Interpreter cpu(mem, thunks);
-    constexpr VAddr kCode = 0x1000;
-    mem.LoadCode(kCode,
-                 {0x39, 0xF7,             // cmp edi, esi
-                  0x0F, 0x94, 0xC0,       // sete al
-                  0x0F, 0xB6, 0xC0,       // movzx eax, al
-                  0xC3});                 // ret
-    cpu.State().Reg(Gpr::Rsp) = 0x8000;
-    Check(cpu.CallGuestFunction(kCode, {9, 9}) == 1, "TestCompareEqual: 9 == 9 -> 1");
-    Check(cpu.CallGuestFunction(kCode, {9, 8}) == 0, "TestCompareEqual: 9 != 8 -> 0");
-}
-
-// --- Test D: the guest<->host call boundary (HostThunkTable) ------------------------------------
-// movabs rax, <thunk address> ; call rax ; add eax, 1 ; ret
-// The thunk itself is a real host C++ function that doubles rdi - standing in for what a PS4
-// HLE library import (core/libraries/**) will eventually be once this is wired into shadPS4 for
-// real (see PROJECT.md, "Guest<->host call boundary").
-void TestHostThunkBoundary() {
-    FlatGuestMemory mem(0x10000);
-    HostThunkTable thunks;
-    const std::uint64_t thunk_addr = thunks.Register([](X86Interpreter& cpu) {
-        cpu.State().Reg(Gpr::Rax) = cpu.State().Reg(Gpr::Rdi) * 2;
-    });
-
-    X86Interpreter cpu(mem, thunks);
-    constexpr VAddr kCode = 0x1000;
-    std::vector<std::uint8_t> code = {0x48, 0xB8}; // movabs rax, imm64
-    for (int i = 0; i < 8; i++) {
-        code.push_back(static_cast<std::uint8_t>(thunk_addr >> (8 * i)));
-    }
-    code.push_back(0xFF);
-    code.push_back(0xD0); // call rax
-    code.push_back(0x05); // add eax, imm32
-    code.push_back(0x01);
-    code.push_back(0x00);
-    code.push_back(0x00);
-    code.push_back(0x00);
-    code.push_back(0xC3); // ret
-    mem.LoadCode(kCode, {});
-    for (std::size_t i = 0; i < code.size(); i++) {
-        mem.Translate(kCode + i, 1, true)[0] = code[i];
-    }
-    cpu.State().Reg(Gpr::Rsp) = 0x8000;
-    const std::uint64_t result = cpu.CallGuestFunction(kCode, {20});
-    Check(result == 41, "TestHostThunkBoundary: thunk(20)*2 + 1 == 41");
-}
-
-// --- Test E: RunMainEntry's exact stack/register setup -----------------------------------------
-// Mirrors what Core::Linker::RunMainEntry's inline asm does: verifies the guest sees the same
-// 16 bytes both through rdi (the params pointer) and copied onto the stack, in the documented
-// field order.
-struct ExitSignal {
-    std::uint64_t rax, rbx, rcx, rdx;
-};
-
-void TestRunMainEntryStackLayout() {
-    FlatGuestMemory mem(0x10000);
-    HostThunkTable thunks;
-    const std::uint64_t exit_addr = thunks.Register([](X86Interpreter& cpu) {
-        throw ExitSignal{cpu.State().Reg(Gpr::Rax), cpu.State().Reg(Gpr::Rbx),
-                          cpu.State().Reg(Gpr::Rcx), cpu.State().Reg(Gpr::Rdx)};
-    });
-
-    X86Interpreter cpu(mem, thunks);
-    constexpr VAddr kCode = 0x1000;
-    constexpr VAddr kParams = 0x2000;
-    mem.Translate(kParams, 8, true);
-    const std::uint64_t field0 = 0x1111'1111'2222'2222ull;
-    const std::uint64_t field1 = 0x3333'3333'4444'4444ull;
-    mem.Write(kParams, field0, 8);
-    mem.Write(kParams + 8, field1, 8);
-
-    mem.LoadCode(kCode,
-                 {0x48, 0x8B, 0x07,             // mov rax, [rdi]
-                  0x48, 0x8B, 0x5F, 0x08,       // mov rbx, [rdi+8]
-                  0x48, 0x8B, 0x0C, 0x24,       // mov rcx, [rsp]
-                  0x48, 0x8B, 0x54, 0x24, 0x08, // mov rdx, [rsp+8]
-                  0xFF, 0xD6,                   // call rsi
-                  0xC3});                       // ret (unreachable: the thunk throws)
-
-    cpu.State().Reg(Gpr::Rsp) = 0x8000;
-    bool threw = false;
-    try {
-        cpu.RunMainEntry(kCode, kParams, exit_addr);
-    } catch (const ExitSignal& signal) {
-        threw = true;
-        Check(signal.rax == field0, "TestRunMainEntryStackLayout: [rdi] == field0");
-        Check(signal.rbx == field1, "TestRunMainEntryStackLayout: [rdi+8] == field1");
-        Check(signal.rcx == field0, "TestRunMainEntryStackLayout: [rsp] == field0 (stack copy)");
-        Check(signal.rdx == field1, "TestRunMainEntryStackLayout: [rsp+8] == field1 (stack copy)");
-    }
-    Check(threw, "TestRunMainEntryStackLayout: exit thunk was reached");
-}
-
-// --- Test F: GuestAddressSpace in isolation -----------------------------------------------------
-void TestGuestAddressSpaceBasics() {
-    GuestAddressSpace space;
-    const std::uint64_t region_a = space.MapAnywhere(0x1000);
-    const std::uint64_t region_b = space.MapAnywhere(0x2000);
-    Check(region_b >= region_a + 0x1000, "TestGuestAddressSpaceBasics: regions don't overlap");
-
-    space.Write(region_a + 8, 0xDEAD'BEEFu, 4);
-    Check(space.Read(region_a + 8, 4) == 0xDEAD'BEEFu,
-          "TestGuestAddressSpaceBasics: round-trips a write inside a mapped region");
-    Check(space.Read(region_a, 4) == 0, "TestGuestAddressSpaceBasics: mappings start zeroed");
-
-    // A request straddling the end of a mapped region (documented limitation - see
-    // guest_address_space.h) returns nullptr from Translate() directly. Deliberately checking
-    // Translate() itself here rather than going through GuestMemory::Read()/Write(): those
-    // dereference whatever Translate() returns with no null check (by design - see
-    // guest_memory.h), so calling them on an out-of-range request would crash the process
-    // rather than fail a check. The interpreter's own Step() already treats a null Translate()
-    // result as a fault (see the Fatal() call there); ReadOperand()/WriteOperand() don't yet -
-    // that's a real follow-up, not something to paper over with a try/catch here.
-    Check(space.Translate(region_a + 0x1000 - 2, 4, false) == nullptr,
-          "TestGuestAddressSpaceBasics: a request straddling a region's end is rejected");
-
-    space.Unmap(region_a);
-    Check(space.Translate(region_a, 1, false) == nullptr,
-          "TestGuestAddressSpaceBasics: Unmap() makes the region untranslatable");
-}
-
-// --- Test G: the interpreter running entirely on GuestAddressSpace (not the flat test buffer) --
-// Same computation as TestAddFunction, but through the real memory abstraction this is meant to
-// replace Core::AddressSpace with, including code and stack living in separately-mapped regions
-// (the way a real ELF's code segment and stack normally would be).
-void TestInterpreterOverGuestAddressSpace() {
-    GuestAddressSpace space;
-    HostThunkTable thunks;
-    X86Interpreter cpu(space, thunks);
-
-    const std::uint64_t code_region = space.MapAnywhere(0x1000);
-    const std::uint64_t stack_region = space.MapAnywhere(0x4000);
-    std::uint8_t* code = space.Translate(code_region, 5, true);
-    const std::uint8_t bytes[] = {0x89, 0xF8, 0x01, 0xF0, 0xC3}; // mov eax,edi; add eax,esi; ret
-    std::memcpy(code, bytes, sizeof(bytes));
-
-    cpu.State().Reg(Gpr::Rsp) = stack_region + 0x4000; // stack grows down from the region's top
-    const std::uint64_t result = cpu.CallGuestFunction(code_region, {10, 32});
-    Check(result == 42, "TestInterpreterOverGuestAddressSpace: 10 + 32 == 42, via two separately "
-                         "mapped regions for code and stack");
+double HostCallback(int a, u64 table, double d) {
+    // Called from guest code through an HLE thunk, and itself calls back into guest code.
+    const int nested = CallGuest<int>(Fn(k_add), 1, 2);
+    return a + d + nested + (table == kData ? 0.0 : 1000.0);
 }
 
 } // namespace
 
 int main() {
-    TestAddFunction();
-    TestLoopTriangularNumber();
-    TestCompareEqual();
-    TestHostThunkBoundary();
-    TestRunMainEntryStackLayout();
-    TestGuestAddressSpaceBasics();
-    TestInterpreterOverGuestAddressSpace();
+    std::memcpy(reinterpret_cast<void*>(kCode), kGuestCode, sizeof(kGuestCode));
 
-    if (g_failures > 0) {
-        std::fprintf(stderr, "\n%d check(s) FAILED\n", g_failures);
-        return 1;
+    Check(CallGuest<int>(Fn(k_add), 3, 4) == 7, "add: 3 + 4");
+    Check(CallGuest<u64>(Fn(k_sum), 100) == 5050, "loop: sum(1..100)");
+    Check(CallGuest<u64>(Fn(k_muldiv), 123456789, 1000) == 12345678900ULL, "imul + div");
+    Check(CallGuest<s64>(Fn(k_muldiv2), static_cast<u64>(-50), 3) == -21, "imul + cqo + idiv");
+    Check(CallGuest<u64>(Fn(k_calls), 10) == 45, "nested call + lea");
+    Check(CallGuest<int>(Fn(k_flags), 1, 2) == 1, "cmp/setl (1 < 2)");
+    Check(CallGuest<int>(Fn(k_flags), 5, 2) == 100, "cmp/cmovg (5 > 2)");
+
+    auto* data = reinterpret_cast<char*>(kData);
+    std::strcpy(data, "interpreter");
+    Check(CallGuest<u64>(Fn(k_strlen), data) == 11, "repne scasb strlen");
+    CallGuest<u64>(Fn(k_memcpy), data + 64, data, 12);
+    Check(std::strcmp(data + 64, "interpreter") == 0, "rep movsb memcpy");
+
+    auto* word = reinterpret_cast<u32*>(kData + 128);
+    *word = 5;
+    Check(CallGuest<int>(Fn(k_cmpxchg), word, 5, 9) == 1 && *word == 9,
+          "lock cmpxchg succeeds when expected matches");
+    Check(CallGuest<int>(Fn(k_cmpxchg), word, 5, 1) == 0 && *word == 9,
+          "lock cmpxchg fails when expected differs");
+    Check(CallGuest<u32>(Fn(k_xadd), word, 3) == 9 && *word == 12, "lock xadd");
+
+    Check(CallGuest<int>(Fn(k_sse_scalar), 6, 7) == 84, "cvtsi2ss/mulss/addss/cvttss2si");
+
+    auto* va = reinterpret_cast<u32*>(kData + 256);
+    auto* vb = reinterpret_cast<u32*>(kData + 288);
+    for (u32 i = 0; i < 4; i++) {
+        va[i] = i + 1;
+        vb[i] = (i + 1) * 10;
     }
-    std::fprintf(stderr, "\nAll checks passed\n");
-    return 0;
+    const int ptest_zero = CallGuest<int>(Fn(k_sse_packed), va, vb);
+    Check(va[0] == 44 && va[1] == 33 && va[2] == 22 && va[3] == 11, "paddd + pshufd 0x1b");
+    Check(ptest_zero == 1, "ptest sets ZF for a zero register");
+
+    auto* bytes = reinterpret_cast<u8*>(kData + 320);
+    auto* mask = reinterpret_cast<u8*>(kData + 352);
+    for (u8 i = 0; i < 16; i++) {
+        bytes[i] = i * 3;
+        mask[i] = 15 - i;
+    }
+    mask[0] = 0x80;
+    CallGuest<u64>(Fn(k_pshufb), bytes, mask);
+    Check(bytes[0] == 0 && bytes[1] == 14 * 3 && bytes[15] == 0, "pshufb (incl. zeroing lane)");
+
+    auto* fa = reinterpret_cast<float*>(kData + 384);
+    auto* fb = reinterpret_cast<float*>(kData + 416);
+    for (int i = 0; i < 8; i++) {
+        fa[i] = 1.5f * i;
+        fb[i] = 0.5f;
+    }
+    const u32 lane4 = CallGuest<u32>(Fn(k_avx), fa, fb);
+    float f4;
+    std::memcpy(&f4, &lane4, 4);
+    Check(fa[7] == 11.0f && f4 == 6.5f, "vaddps ymm + vextractf128 + vmovd");
+
+    Check(CallGuest<int>(Fn(k_x87), 12) == 144, "x87 fild/fmulp/fistp");
+    Check(CallGuest<double>(Fn(k_double), 1.5, 2.0) == 12.25, "addsd/mulsd with double args");
+
+    // Guest -> host -> guest: f_hle loads a thunk address from [rdi] and calls it with
+    // (int 40, pointer, double 2.5); the host function calls f_add(1, 2) back in the guest.
+    *reinterpret_cast<u64*>(kData) = reinterpret_cast<u64>(HleAddress<&HostCallback>());
+    Check(CallGuest<double>(Fn(k_hle), kData) == 45.5, "HLE thunk args/return + nested guest call");
+
+    Cpu::Current().State().fs_base = kData + 512;
+    *reinterpret_cast<u64*>(kData + 512) = 0x1234567890ULL;
+    Check(CallGuest<u64>(Fn(k_tls)) == 0x1234567890ULL, "fs-relative load (TLS)");
+
+    bool faulted = false;
+    try {
+        CallGuest<u64>(Fn(k_strlen), static_cast<u64>(8)); // reads from address 8
+    } catch (const GuestFault&) {
+        faulted = true;
+    }
+    Check(faulted, "wild guest pointer raises GuestFault instead of corrupting memory");
+
+    std::fprintf(stderr, "%d/%d checks passed\n", checks - failures, checks);
+    return failures == 0 ? 0 : 1;
 }
