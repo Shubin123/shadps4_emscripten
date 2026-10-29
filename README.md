@@ -23,9 +23,9 @@ compiled wasm instead of through the interpreter. See PROJECT.md, "Paleblood".
 ## Quick start
 
 ```
-git clone https://github.com/shadps4-emu/shadps4 ~/shadps4_src
-git -C ~/shadps4_src checkout $(cat UPSTREAM_COMMIT)
-git -C ~/shadps4_src submodule update --init --recursive --depth 1
+git clone https://github.com/shadps4-emu/shadps4 ../upstream_native/shadps4
+git -C ../upstream_native/shadps4 checkout $(cat UPSTREAM_COMMIT)
+git -C ../upstream_native/shadps4 submodule update --init --recursive --depth 1
 
 scripts/setup_tree.sh                    # build/patched = upstream src + patches/
 scripts/build_wasm.sh                    # build/wasm/{shadps4,shadps4_node,interpreter_tests,...}.js

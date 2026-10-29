@@ -89,13 +89,13 @@ tests/gpu/                   hand-assembled GCN compute programs dispatched on W
 
 ## Build and test
 
-Needs a shadPS4 checkout with submodules at `UPSTREAM_COMMIT` (default `~/shadps4_src`) and
-Emscripten (tested with 6.0.13).
+Needs a shadPS4 checkout with submodules at `UPSTREAM_COMMIT` (default `../upstream_native/shadps4`)
+and Emscripten (tested with 6.0.13).
 
 ```
-git clone https://github.com/shadps4-emu/shadps4 ~/shadps4_src
-git -C ~/shadps4_src checkout $(cat UPSTREAM_COMMIT)
-git -C ~/shadps4_src submodule update --init --recursive --depth 1
+git clone https://github.com/shadps4-emu/shadps4 ../upstream_native/shadps4
+git -C ../upstream_native/shadps4 checkout $(cat UPSTREAM_COMMIT)
+git -C ../upstream_native/shadps4 submodule update --init --recursive --depth 1
 scripts/setup_tree.sh
 scripts/build_wasm.sh                      # all targets, into build/wasm
 node build/wasm/interpreter_tests.js       # 27/27 + a throughput line

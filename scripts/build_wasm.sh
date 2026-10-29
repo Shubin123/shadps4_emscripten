@@ -20,6 +20,6 @@ fi
 
 if [ ! -f "$build/build.ninja" ]; then
   emcmake cmake -S "$root/emscripten" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE="${BUILD_TYPE:-Release}" \
-    -DSHADPS4_SRC_DIR="${SHADPS4_SRC_DIR:-$HOME/shadps4_src}"
+    -DSHADPS4_SRC_DIR="${SHADPS4_SRC_DIR:-$root/../upstream_native/shadps4}"
 fi
 cmake --build "$build" "$@"

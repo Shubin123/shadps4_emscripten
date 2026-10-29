@@ -3,11 +3,11 @@
 # "upstream" commit), with patches/*.patch applied on top as uncommitted changes. Edit files there
 # while developing, then run scripts/export_patches.sh to turn the diff back into patches/.
 #
-#   SHADPS4_SRC_DIR=~/shadps4_src scripts/setup_tree.sh [--force]
+#   SHADPS4_SRC_DIR=../upstream_native/shadps4 scripts/setup_tree.sh [--force]
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-src=${SHADPS4_SRC_DIR:-$HOME/shadps4_src}
+src=${SHADPS4_SRC_DIR:-$root/../upstream_native/shadps4}
 pin=$(cat "$root/UPSTREAM_COMMIT")
 dest="$root/build/patched"
 

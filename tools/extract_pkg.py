@@ -8,7 +8,7 @@ but walks the inner PFS's directory tree properly instead of the old pattern-mat
 No key material lives in this repo: the fake keysets are read out of shadPS4's own git history
 (src/core/crypto/keys.h, deleted in be22674f), so a shadPS4 checkout is required.
 
-    tools/extract_pkg.py GAME.pkg OUT_DIR [--shadps4-src ~/shadps4_src] [--list]
+    tools/extract_pkg.py GAME.pkg OUT_DIR [--shadps4-src ../upstream_native/shadps4] [--list]
 
 Requires the `cryptography` package (AES-XTS/CBC, RSA). Only fPKGs are supported; retail PKGs
 are encrypted with console-unique keys.
@@ -193,7 +193,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pkg")
     ap.add_argument("out", nargs="?")
-    ap.add_argument("--shadps4-src", default=os.path.expanduser("~/shadps4_src"))
+    ap.add_argument("--shadps4-src", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                          "../../upstream_native/shadps4"))
     ap.add_argument("--list", action="store_true", help="list files instead of extracting")
     args = ap.parse_args()
 
