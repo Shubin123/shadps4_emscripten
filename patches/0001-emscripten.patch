@@ -173,22 +173,23 @@ index ed2deed..2e18289 100644
  namespace Common {
  
 diff --git a/src/core/address_space.cpp b/src/core/address_space.cpp
-index 10b0bc3..b110715 100644
+index 10b0bc3..d56510b 100644
 --- a/src/core/address_space.cpp
 +++ b/src/core/address_space.cpp
-@@ -22,6 +22,11 @@
+@@ -22,6 +22,12 @@
  #include <fcntl.h>
  #include <sys/mman.h>
  #endif
 +#ifdef ARCH_WASM
 +#include <unistd.h>
 +#include <emscripten/heap.h>
++#include "core/wasm_high_memory.h"
 +#include "core/wasm_layout.h"
 +#endif
  
  #if defined(__APPLE__) && defined(ARCH_X86_64)
  // Reserve space for the system address space using a zerofill section.
-@@ -33,6 +38,15 @@ asm(".zerofill USER_AREA,USER_AREA,__USER_AREA,0x5F9000000000");
+@@ -33,6 +39,15 @@ asm(".zerofill USER_AREA,USER_AREA,__USER_AREA,0x5F9000000000");
  namespace Core {
  
  // Constants used for mapping address space.
@@ -204,7 +205,7 @@ index 10b0bc3..b110715 100644
  constexpr VAddr SYSTEM_MANAGED_MIN = 0x400000ULL;
  constexpr VAddr SYSTEM_MANAGED_MAX = 0x7FFFFBFFFULL;
  constexpr VAddr SYSTEM_RESERVED_MIN = 0x7FFFFC000ULL;
-@@ -54,6 +68,7 @@ constexpr VAddr USER_MAX = 0xFFFFFFFFFFFULL;
+@@ -54,6 +69,7 @@ constexpr VAddr USER_MAX = 0xFFFFFFFFFFFULL;
  #else
  constexpr VAddr USER_MAX = 0x5FFFFFFFFFFFULL;
  #endif
@@ -212,7 +213,7 @@ index 10b0bc3..b110715 100644
  
  // Constants for the sizes of the ranges in address space.
  static constexpr u64 SystemManagedSize = SYSTEM_MANAGED_MAX - SYSTEM_MANAGED_MIN + 1;
-@@ -626,6 +641,110 @@ struct AddressSpace::Impl {
+@@ -626,6 +642,163 @@ struct AddressSpace::Impl {
      u64 user_size{};
      std::map<VAddr, MemoryRegion> regions;
  };
@@ -255,6 +256,9 @@ index 10b0bc3..b110715 100644
 +    }
 +
 +    void* Map(VAddr virtual_addr, PAddr phys_addr, u64 size, WasmPageProtection, int fd = -1) {
++        if (HighMemory::InRange(virtual_addr)) {
++            return MapHigh(virtual_addr, phys_addr, size, fd);
++        }
 +        ASSERT_MSG(virtual_addr >= SYSTEM_MANAGED_MIN && virtual_addr + size <= USER_MAX + 1,
 +                   "guest mapping {:#x}+{:#x} is outside the wasm guest window", virtual_addr,
 +                   size);
@@ -270,47 +274,97 @@ index 10b0bc3..b110715 100644
 +        dirty += range;
 +
 +        if (fd != -1) {
-+            // File mapping: copy the file contents in. Writes don't propagate back to the file.
-+            u64 done = 0;
-+            while (done < size) {
-+                const ssize_t n = pread(fd, ptr + done, size - done, phys_addr + done);
-+                if (n <= 0) {
-+                    break;
-+                }
-+                done += static_cast<u64>(n);
-+            }
++            ReadFile(fd, ptr, size, phys_addr);
 +            return ptr;
 +        }
 +        if (phys_addr != static_cast<PAddr>(-1)) {
-+            const auto alias = phys_mappings.find(phys_addr);
-+            if (alias != phys_mappings.end() && alias->second != virtual_addr) {
++            if (u8* existing = FindPhys(phys_addr, size)) {
++                // An identity-mapped address can only be its own storage, so a second view of
++                // physical memory that's already mapped somewhere gets a copy, not an alias.
 +                if (alias_warnings++ < 16) {
 +                    LOG_WARNING(Kernel_Vmm,
-+                                "phys {:#x} already mapped at {:#x}; mapping it again at {:#x} "
-+                                "gets a copy, not an alias (unsupported in wasm)",
-+                                phys_addr, alias->second, virtual_addr);
++                                "phys {:#x} already mapped; mapping it again at {:#x} gets a copy, "
++                                "not an alias (unsupported below 12GB in wasm)",
++                                phys_addr, virtual_addr);
 +                }
-+                std::memcpy(ptr, reinterpret_cast<const void*>(alias->second), size);
++                std::memcpy(ptr, existing, size);
 +            } else {
-+                phys_mappings[phys_addr] = virtual_addr;
++                phys_backing[phys_addr] = {size, ptr, virtual_addr};
 +            }
 +        }
 +        return ptr;
 +    }
 +
++    // Fixed mappings above the identity window: backed by heap memory, reached through
++    // HighMemory's page table. Physical memory mapped here *can* be aliased: a view of physical
++    // pages that are already mapped elsewhere points at the same host storage.
++    void* MapHigh(VAddr virtual_addr, PAddr phys_addr, u64 size, int fd) {
++        std::scoped_lock lk{mutex};
++        u8* host = nullptr;
++        if (fd == -1 && phys_addr != static_cast<PAddr>(-1)) {
++            host = FindPhys(phys_addr, size);
++        }
++        if (!host) {
++            host = static_cast<u8*>(std::aligned_alloc(HighMemory::kPageSize, size));
++            ASSERT_MSG(host, "out of memory backing a {:#x}-byte high mapping", size);
++            std::memset(host, 0, size);
++            if (fd != -1) {
++                ReadFile(fd, host, size, phys_addr);
++            } else if (phys_addr != static_cast<PAddr>(-1)) {
++                phys_backing[phys_addr] = {size, host, virtual_addr};
++            }
++        }
++        HighMemory::Map(virtual_addr, size, host);
++        return reinterpret_cast<void*>(virtual_addr);
++    }
++
++    // Host storage currently holding physical range [phys, phys + size), if any mapping has it.
++    u8* FindPhys(PAddr phys, u64 size) {
++        auto it = phys_backing.upper_bound(phys);
++        if (it == phys_backing.begin()) {
++            return nullptr;
++        }
++        --it;
++        if (phys + size > it->first + it->second.size) {
++            return nullptr;
++        }
++        return it->second.host + (phys - it->first);
++    }
++
++    static void ReadFile(int fd, u8* dst, u64 size, u64 offset) {
++        // File mapping: copy the file contents in. Writes don't propagate back to the file.
++        u64 done = 0;
++        while (done < size) {
++            const ssize_t n = pread(fd, dst + done, size - done, offset + done);
++            if (n <= 0) {
++                break;
++            }
++            done += static_cast<u64>(n);
++        }
++    }
++
 +    VAddr Unmap(VAddr virtual_addr, u64* size) {
 +        std::scoped_lock lk{mutex};
-+        std::erase_if(phys_mappings, [&](const auto& m) {
-+            return m.second >= virtual_addr && m.second < virtual_addr + *size;
++        std::erase_if(phys_backing, [&](const auto& m) {
++            return m.second.va >= virtual_addr && m.second.va < virtual_addr + *size;
 +        });
++        if (HighMemory::InRange(virtual_addr)) {
++            // Backing allocations are left alive: other high views may still alias them.
++            HighMemory::Unmap(virtual_addr, *size);
++        }
 +        return virtual_addr;
 +    }
 +
 +    void Protect(VAddr, u64, bool, bool, bool) {}
 +
++    struct PhysBacking {
++        u64 size;
++        u8* host;
++        VAddr va;
++    };
 +    std::mutex mutex;
 +    boost::icl::interval_set<VAddr> dirty;
-+    std::map<PAddr, VAddr> phys_mappings;
++    std::map<PAddr, PhysBacking> phys_backing;
 +    u32 alias_warnings{};
 +    u8* backing_base{};
 +    u8* system_managed_base{};
@@ -323,21 +377,46 @@ index 10b0bc3..b110715 100644
  #else
  
  enum PosixPageProtection {
-@@ -847,8 +966,14 @@ void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_e
+@@ -847,10 +1020,28 @@ void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_e
      if (phys_addr != -1 && std::bit_width(end_addr) <= Traits::ADDRESS_SPACE_BITS) {
          const u64 base_page = virtual_addr >> Traits::PAGE_BITS;
          for (u64 offset = 0; offset < size; offset += 16_KB) {
 +#ifdef ARCH_WASM
-+            // No separate backing store to point at: the guest pages are the storage.
-+            backing_pages[base_page + (offset >> Traits::PAGE_BITS)] =
-+                reinterpret_cast<u8*>(virtual_addr + offset);
++            // No separate backing store to point at: the guest pages are the storage (set below,
++            // after the mapping exists, so high-region pages can be translated).
 +#else
              backing_pages[base_page + (offset >> Traits::PAGE_BITS)] =
                  backing_base + phys_addr + offset;
 +#endif
++        }
++    }
++#ifdef ARCH_WASM
++    void* const result = impl->Map(virtual_addr, phys_addr, size, PAGE_READWRITE);
++    if (phys_addr != -1 && std::bit_width(end_addr) <= Traits::ADDRESS_SPACE_BITS) {
++        const u64 base_page = virtual_addr >> Traits::PAGE_BITS;
++        for (u64 offset = 0; offset < size; offset += 16_KB) {
++            u8* host = HighMemory::InRange(virtual_addr)
++                           ? HighMemory::Translate(virtual_addr + offset)
++                           : reinterpret_cast<u8*>(virtual_addr + offset);
++            backing_pages[base_page + (offset >> Traits::PAGE_BITS)] = host;
          }
      }
++    return result;
++#endif
  #if ARCH_X86_64
+     const auto prot = is_exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+ #else
+@@ -903,6 +1094,10 @@ boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
+     reserved_regions.insert({system_managed_addr, system_managed_addr + system_managed_size});
+     reserved_regions.insert({system_reserved_addr, system_reserved_addr + system_reserved_size});
+     reserved_regions.insert({user_addr, user_addr + user_size});
++#ifdef ARCH_WASM
++    // Only reachable by fixed-address mappings: SearchFree never looks past the user region.
++    reserved_regions.insert({WasmLayout::HighMin, WasmLayout::HighMax + 1});
++#endif
+     return reserved_regions;
+ #endif
+ }
 diff --git a/src/core/debug_state.cpp b/src/core/debug_state.cpp
 index 3d6ec64..604edac 100644
 --- a/src/core/debug_state.cpp

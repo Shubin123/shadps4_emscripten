@@ -5,6 +5,7 @@
 // real assembler output (guest_code.s -> guest_code.inc via gen_guest_code.sh), not hand-encoded
 // bytes, so what's being checked is the interpreter's semantics rather than the test's encoding.
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -123,6 +124,18 @@ int main() {
         faulted = true;
     }
     Check(faulted, "wild guest pointer raises GuestFault instead of corrupting memory");
+
+    // Throughput, for the record (not a pass/fail check): the sum loop is 5 instructions per
+    // iteration.
+    const u64 before = Cpu::Current().InstructionsExecuted();
+    const auto t0 = std::chrono::steady_clock::now();
+    const u64 sum = CallGuest<u64>(Fn(k_sum), 20'000'000);
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const u64 executed = Cpu::Current().InstructionsExecuted() - before;
+    std::fprintf(stderr, "throughput: %llu guest instructions in %.2fs = %.1f MIPS (sum %llu)\n",
+                 static_cast<unsigned long long>(executed), secs, executed / secs / 1e6,
+                 static_cast<unsigned long long>(sum));
 
     std::fprintf(stderr, "%d/%d checks passed\n", checks - failures, checks);
     return failures == 0 ? 0 : 1;

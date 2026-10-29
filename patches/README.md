@@ -1,12 +1,11 @@
 # patches/
 
-`new_files/` mirrors the path new interpreter source will have inside a shadPS4 checkout
-(`new_files/core/interpreter/x86_interpreter.cpp` -> `src/core/interpreter/x86_interpreter.cpp`).
-Nothing here has been applied to a real shadPS4 checkout yet - there is no CMake integration
-(see PROJECT.md, M6) and no diff-style patches against existing shadPS4 files yet either. Right
-now this only builds standalone via `../tests/interpreter/CMakeLists.txt`.
+- `0001-emscripten.patch` - every change to an upstream shadPS4 file, as one diff against the
+  commit in `../UPSTREAM_COMMIT`. All of it is behind `ARCH_WASM` (defined for Emscripten in
+  `common/arch.h`), so native builds are unaffected.
+- `new_files/` - new sources, laid out like upstream's `src/`
+  (`new_files/core/interpreter/cpu.cpp` is compiled as if it were `src/core/interpreter/cpu.cpp`).
 
-Once M6 (Emscripten/CMake build integration) starts, expect this directory to also gain unified
-diffs against files shadPS4 already has (`CMakeLists.txt`, `src/core/linker.cpp`, ...), applied
-by a build script the way azahar_web's `patches/*.patch` are - not committed as a second
-first-class copy of shadPS4's own build files.
+`../scripts/setup_tree.sh` applies the patch to a copy of upstream's `src/` in `../build/patched`
+(its own git repo, tagged `upstream`); after editing there, `../scripts/export_patches.sh` writes
+the diff back here. The build compiles `build/patched/src` and `new_files/` together.

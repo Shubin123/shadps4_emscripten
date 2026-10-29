@@ -10,6 +10,7 @@
 #include "common/logging/log.h"
 #include "core/interpreter/cpu.h"
 #include "core/interpreter/hle.h"
+#include "core/wasm_high_memory.h"
 
 namespace Core::Interpreter {
 
@@ -147,6 +148,18 @@ Cpu* Cpu::CurrentIfAny() {
 }
 
 u8* Cpu::SlowPtr(u64 addr, u64 size) {
+    // Fixed mappings above the identity window are reached through a page table
+    // (core/wasm_high_memory.h). An access crossing into the next page is fine as long as both
+    // pages are backed contiguously, which they are within any one mapping.
+    if (HighMemory::InRange(addr)) {
+        u8* host = HighMemory::Translate(addr);
+        if (host && (size <= 1 || HighMemory::Translate(addr + size - 1) == host + size - 1)) {
+            return host;
+        }
+        Fault(host ? "guest access straddles separately-backed high pages"
+                   : "guest memory access to an unmapped high address",
+              addr);
+    }
     // Linear memory may have grown since this thread last looked.
     mem_limit = emscripten_get_heap_size();
     if (addr >= kMinAddress && addr + size <= mem_limit && addr + size >= addr) {

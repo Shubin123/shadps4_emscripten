@@ -1,41 +1,33 @@
-# shadPS4 Emscripten wrapper
+# shadPS4 Emscripten port
 
-An attempt at a WebAssembly build of [shadPS4](https://github.com/shadps4-emu/shadps4), in the
-spirit of [azahar_web](https://github.com/Shubin123/azahar_web) (the same approach applied to
-Azahar/Citra). It is **not** at the point of running anything yet - read
-[PROJECT.md](PROJECT.md) first. The short version: shadPS4 runs PS4 (x86-64) game code directly
-on the host CPU rather than emulating it, which is not something WebAssembly can do at all, so
-unlike the Citra port this isn't a matter of swapping in an existing interpreter - it means
-building one from scratch. That's what's in progress.
+A WebAssembly build of [shadPS4](https://github.com/shadps4-emu/shadps4), the PS4 emulator. The
+browser frontend is [shadps4_web](https://github.com/Shubin123/shadps4_web).
 
-## What exists right now
+shadPS4 runs PS4 (x86-64) code directly on the host CPU instead of emulating it, which a browser
+can't do, so this port adds an x86-64 interpreter and the plumbing to run upstream shadPS4's own
+loader, linker, memory manager and HLE libraries around it, compiled for wasm64. Read
+[PROJECT.md](PROJECT.md) for the design, status and limits.
 
-- `patches/new_files/core/interpreter/` - a from-scratch x86-64 instruction interpreter: register
-  file, flags, a growing integer/control-flow instruction set, a guest virtual-memory stand-in
-  (`GuestAddressSpace`), and the mechanism for guest code to call back out to real host functions
-  (`HostThunkTable`).
-- `patches/0001-linker-emscripten-run-main-entry.patch` - a real diff against shadPS4's
-  `src/core/linker.cpp` connecting its `RunMainEntry` to the interpreter above. Verified to apply
-  cleanly; not yet buildable (see PROJECT.md for exactly what's still missing).
-- `tests/interpreter/` - a standalone build proving the interpreter and `GuestAddressSpace`
-  against hand-assembled machine code, independent of the (not yet written) Emscripten/shadPS4
-  build integration:
+**Where it is:** games load and their code runs (in Node and in Chrome), but nothing the PS4 GPU
+draws is rendered yet - there is no WebGPU backend for shadPS4's Vulkan renderer - and the
+interpreter is slow (~60 MIPS). The test game, Bully (a PS2 Classic, CUSA03507), gets as far as
+native shadPS4 does: its PS2 emulator initializes, then stops where it needs a JIT compiler
+process that shadPS4 doesn't support on any platform.
 
-  ```
-  git clone https://github.com/shadps4-emu/shadps4 ~/shadps4_src
-  git -C ~/shadps4_src submodule update --init --depth 1 externals/zydis
-  git -C ~/shadps4_src/externals/zydis submodule update --init --depth 1 dependencies/zycore
+## Quick start
 
-  cmake -S tests/interpreter -B tests/interpreter/build -DSHADPS4_SRC_DIR=~/shadps4_src
-  cmake --build tests/interpreter/build
-  ./tests/interpreter/build/interpreter_tests
-  ```
-- The web frontend lives in a separate repo,
-  [shadps4_web](https://github.com/Shubin123/shadps4_web) (live at
-  <https://shubin123.github.io/shadps4_web/>). That repo holds only the static site and, once
-  this backend produces one, the built `.wasm`/`.js` artifacts - the same split as Azahar's
-  engine checkout vs. [azahar_web](https://github.com/Shubin123/azahar_web).
+```
+git clone https://github.com/shadps4-emu/shadps4 ~/shadps4_src
+git -C ~/shadps4_src checkout $(cat UPSTREAM_COMMIT)
+git -C ~/shadps4_src submodule update --init --recursive --depth 1
 
-See [PROJECT.md](PROJECT.md) for the full architecture, what's actually implemented vs. planned,
-and the two big pieces of remaining work (guest virtual memory, and wiring the interpreter into
-shadPS4's linker/HLE layers) in detail.
+scripts/setup_tree.sh                    # build/patched = upstream src + patches/
+scripts/build_wasm.sh                    # build/wasm/{shadps4,shadps4_node,interpreter_tests}.js
+node build/wasm/interpreter_tests.js     # interpreter tests
+
+tools/extract_pkg.py GAME.pkg ../games/ps4/GAME   # fake-signed PKGs; needs `cryptography`
+scripts/run_node.sh ../games/ps4/GAME/eboot.bin   # headless run, log in build/run/out.txt
+```
+
+For the browser, copy `build/wasm/shadps4.{js,wasm}` into shadps4_web (`scripts/sync_runtime.sh`
+there) and serve it with the COOP/COEP headers its dev server sets.

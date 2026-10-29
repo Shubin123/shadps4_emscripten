@@ -1,212 +1,211 @@
-# Project: shadPS4 Emscripten Wrapper
+# Project: shadPS4 Emscripten port
 
 ## Why this is a different kind of port than azahar_web
 
-[azahar_web](https://github.com/Shubin123/azahar_web) ports Azahar (a Citra/3DS-emulator fork) to
-WebAssembly. That worked because Citra's CPU core is swappable: disable the `dynarmic` JIT,
-route execution through `dyncom` (a portable C++ ARM11 interpreter Citra already shipped), pair
-it with the existing software rasterizer instead of OpenGL/Vulkan, and the rest is ordinary C++
-that Emscripten compiles like any other target.
-
-shadPS4 has no equivalent fallback, for a structural reason: the PS4 and a PC are both x86-64, so
-shadPS4 doesn't emulate the CPU at all. It maps the PS4 ELF into memory and **runs the game's
-x86-64 code directly on the host CPU** (Wine-style), using Xbyak-generated trampolines and
-SIGSEGV/SIGILL handlers to intercept guest memory faults and illegal instructions
-(`src/core/cpu_patches.cpp`, `src/core/signals.cpp`). There is no interpreter core to swap in,
-because the direct-execution model never needed one. WebAssembly cannot be handed arbitrary
-native machine code to execute, and has nothing resembling POSIX signal-based fault handling, so
-none of that is available in the Emscripten build - not as a performance regression, but as a
-hard capability gap.
-
-Separately, shadPS4's renderer is **Vulkan-only** (`src/video_core/renderer_vulkan`, GCN shaders
-recompiled to SPIR-V via `shader_recompiler`) - there's no software-rasterizer fallback the way
-Citra had. That's a second, independent blocker (no browser exposes Vulkan) tracked as its own
-milestone below; it does not block CPU work and isn't where this project started.
-
-The scope decided on (2026-10-28): build a from-scratch x86-64 interpreter rather than stopping
-at a frontend-only scaffold. That is a new emulation subsystem shadPS4 itself doesn't have, not a
-"port" in the azahar_web sense - realistically a long-running effort. What follows is what
-actually exists today, not a plan dressed up as progress.
+[azahar_web](https://github.com/Shubin123/azahar_web) ports Azahar (a Citra fork) to WebAssembly
+by swapping Citra's JIT for the portable ARM interpreter Citra already shipped. shadPS4 has no
+equivalent: the PS4 and a PC are both x86-64, so shadPS4 doesn't emulate the CPU at all - it maps
+the PS4 ELF into memory and **runs the game's x86-64 code directly on the host CPU**, patching
+what the host can't run (`core/cpu_patches.cpp`) and catching faults with signal handlers
+(`core/signals.cpp`). WebAssembly can't execute machine code it's handed and has no signal-based
+fault handling, so this port needed a new CPU interpreter, a different guest-memory scheme, and a
+way for interpreted guest code and shadPS4's C++ to call each other. Separately, shadPS4's
+renderer is Vulkan-only (`video_core/renderer_vulkan`, GCN shaders recompiled to SPIR-V); no
+browser exposes Vulkan.
 
 ## Status
 
 | Milestone | Scope | Status |
 |---|---|---|
-| M1 | x86-64 instruction interpreter core (register file, flags, ALU/control-flow dispatch) | **Done for the implemented subset** - see Instruction coverage below |
-| M2 | Guest\<->host call boundary (HostThunkTable) | **Done** for the mechanism itself; not yet connected to shadPS4's real `Linker`/`aerolib` import resolution |
-| M3 | Standalone test harness proving M1+M2 against hand-assembled machine code | **Done** - `tests/interpreter/`, 16/16 checks passing |
-| M4 | Guest virtual memory (software MMU replacing `Core::AddressSpace`'s identity mapping) | **Started**: `GuestAddressSpace` exists and is tested standalone (region-list based, not a page table - see below for why). **Not started**: porting the real `Core::Memory`/`AddressSpace` itself, and the HLE-wide audit of `VAddr`-as-host-pointer call sites |
-| M5 | Wiring into shadPS4 proper (`Core::Linker::RunMainEntry`, module init/fini, thread entry, TLS, the ~23 other guest-callable-pointer sites) | **Started**: `patches/0001-linker-emscripten-run-main-entry.patch` connects `RunMainEntry` to the interpreter, verified with `git apply --check` against a real shadPS4 checkout. **Not yet buildable** - blocked on the rest of M4 and all of M6 (see the patch's own comments for specifics). Module init/fini, thread entry, TLS, and the other ~22 sites: not started |
-| M6 | Emscripten/CMake build integration for shadPS4 itself | **Not started.** One concrete blocker already located: the top-level `CMakeLists.txt`'s architecture detection (`BASE_ARCHITECTURE` matched against x86/arm64 regexes) hard-fails with `FATAL_ERROR "Unsupported CPU architecture"` for wasm32/wasm64 before reaching anything target-specific |
-| M7 | SSE/AVX floating point and REP-prefixed string instructions in the interpreter | **Not started** - deliberately deferred, see below |
-| M8 | Vulkan -> web graphics (WebGPU or similar) | **Not started**, independent of M1-M7 |
-| M9 | Frontend, in the separate [shadps4_web](https://github.com/Shubin123/shadps4_web) repo | **Scaffold only**: dev server with COOP/COEP isolation headers (needed for any future pthreads build), a status page reflecting this table, and a file picker that reads a dropped file's header locally and reports what it is - explicitly does not execute anything, because nothing here can yet |
+| M1 | x86-64 interpreter | **Done for what the PS4's Jaguar implements**: integer, x87, SSE-SSE4.2, AVX (no AVX2/FMA, as on Jaguar), F16C, BMI1, LZCNT/POPCNT, MOVBE, AES-NI, PCLMULQDQ. ~60 MIPS on an Apple M4 (see Performance) |
+| M2 | Guest -> host calls (HLE) | **Done**: every `LIB_FUNCTION` gets a synthetic address; its SysV-ABI argument marshalling is generated from the C++ signature (`interpreter/hle.h`), including variadic functions via `VA_CTX` |
+| M3 | Tests | **Done**: 22 checks against assembler-generated x86-64 (`tests/interpreter`), run under Node |
+| M4 | Guest virtual memory | **Done**, with two documented limits (see Guest memory): no aliasing below 12GB, and HLE code can't dereference pointers into the translated high region |
+| M5 | Wiring into shadPS4 | **Done for everything a game hits on boot**: `RunMainEntry`, module start, threads (`_runOnAnotherStack`), TLS (`fs:`), `pthread_once`/cleanup/key destructors, guest signal handlers, guest malloc for TLS, savedata/IME callbacks. Other guest callbacks (fonts, ngs2, AvPlayer, ...) are routed the same way (`Core::ExecuteGuest`) as they turn up |
+| M6 | Emscripten/CMake build | **Done**: `emscripten/CMakeLists.txt` compiles upstream shadPS4's own sources (common, core, ~200 HLE libraries, the GPU command processor) for wasm64 + pthreads; Node and browser targets |
+| M7 | SSE/AVX, string instructions | **Done** (folded into M1) |
+| M8 | Vulkan -> web graphics | **Started**: the VideoOut scan-out path (`video_core/renderer_web`) shows CPU-visible framebuffers on a `<canvas>`, and the command processor's DMA work runs on the CPU. **Not started**: rendering anything the guest draws with the GPU - draws/dispatches are counted and dropped, so GPU-rendered games show a black screen |
+| M9 | Frontend ([shadps4_web](https://github.com/Shubin123/shadps4_web)) | **Done for loading and running**: pick an extracted game folder, start, live log, canvas, keyboard -> pad. Playwright test drives it in headless Chromium |
 
-"Done" above means: implemented, and verified against real test cases that exercise it - not
-"written and assumed correct." M1-M3 already caught one real bug this way (see Interpreter
-design, point 3) that would otherwise have shipped silently wrong.
+## Bully (CUSA03507), end to end
 
-## Where the code lives
+The PKG is a PS2 Classic: `eboot.bin` is Sony's PS2-on-PS4 emulator, `ps2-emu-compiler.self` is
+its JIT (a second process), `image/disc01.iso` is the PS2 disc.
 
-This repo does not vendor shadPS4's source (same reason azahar_web didn't vendor Citra's): clone
-<https://github.com/shadps4-emu/shadps4> separately, e.g. to `~/shadps4_src`, and initialize at
-least these submodules (a shallow top-level clone does not fetch them):
+- **Native shadPS4 (v0.20.1 WIP, 0614ce3, macOS)**: loads, starts libc/libSceFios2, the PS2
+  emulator maps its EE/IOP "flat memory" windows (with "Unable to map ... at physical address"
+  errors for the aliased mirrors), then hangs on a black screen ("SubmitDone: 4597ms since last
+  call"). The shadPS4 compatibility tracker lists it as "Nothing" (issue #3189, v0.20.0).
+- **This port (Node and headless Chrome 156)**: reaches the same point - libSceFios2.prx and
+  libc.prx start, `main` runs, the PS2 emulator prints its banner and config, opens the memory
+  card, logs `EE Flat Memory (4gb) @ 0x80:00000000` and `IOP Flat Memory (4gb) @ 0x90:00000000`
+  (~6 million guest instructions) - then aborts in its own code with `Missing NULL terminator
+  during JitProc revision check`: the handshake with its JIT compiler process. shadPS4 doesn't
+  implement PS4 JIT shared memory (`sceKernelJitCreateSharedMemory` & co. are stubs) or running a
+  second guest process, natively or here, so Bully can't get further on shadPS4 at all until
+  upstream does. Even then nothing would be visible here until M8 has a GPU backend.
 
+Reproduce:
 ```
-git submodule update --init --depth 1 externals/zydis
-git -C externals/zydis submodule update --init --depth 1 dependencies/zycore
-```
-
-New interpreter source lives under `patches/new_files/core/interpreter/` in *this* repo, laid out
-to mirror where it will eventually live inside a shadPS4 checkout
-(`core/interpreter/` under `src/`). Nothing under `patches/` has been applied to a real shadPS4
-checkout yet (there is no CMake integration - M6 above) - today it only builds standalone, via
-`tests/interpreter/CMakeLists.txt`, against a vendored Zydis for decoding.
-
-```
-patches/
-  0001-linker-emscripten-run-main-entry.patch
-                           A real diff against shadPS4's src/core/linker.cpp, verified with
-                           `git apply --check` against an actual checkout. Connects
-                           RunMainEntry to the interpreter. Not yet buildable - see its own
-                           comments for exactly what's still missing (the rest of M4, and M6).
-  new_files/core/interpreter/
-    guest_memory.h          GuestMemory: the memory-access seam (see M4 discussion)
-    guest_address_space.h/.cpp  GuestAddressSpace: the M4 stand-in for Core::AddressSpace
-    x86_register_file.h/.cpp  CpuState: GPRs, RFLAGS, XMM slots, FS/GS bases
-    host_thunk.h/.cpp        HostThunkTable: the guest<->host call-boundary mechanism
-    x86_interpreter.h/.cpp   The decode/dispatch loop itself
-tests/interpreter/
-  CMakeLists.txt           Standalone build (fetches nothing from shadPS4 except Zydis)
-  test_main.cpp            16 checks against hand-assembled x86-64 bytes
-  disasm_check.cpp         Throwaway helper: disassembles a byte array with Zydis's own
-                           formatter, to verify hand-encoded test bytes actually mean what a
-                           comment claims. Keep using this before trusting new hand-assembled
-                           test cases - that's exactly how the EffectiveAddress bug below was
-                           confirmed, not guessed at a second time.
+tools/extract_pkg.py UP9000-CUSA03507_00-SLUS212690000001-A0100-V0102.pkg ../games/ps4/CUSA03507
+scripts/run_node.sh ../games/ps4/CUSA03507/eboot.bin 180          # Node, log in build/run/out.txt
+cd ../shadps4_web && node tests/e2e.mjs ../games/ps4/CUSA03507 "IOP Flat Memory" 300   # browser
 ```
 
-Run the tests:
+## Layout
+
 ```
-cmake -S tests/interpreter -B tests/interpreter/build -DSHADPS4_SRC_DIR=~/shadps4_src
-cmake --build tests/interpreter/build
-./tests/interpreter/build/interpreter_tests
+UPSTREAM_COMMIT              shadPS4 commit the patch is made against (0614ce32)
+emscripten/CMakeLists.txt    the wasm build (targets: shadps4, shadps4_node, interpreter_tests)
+emscripten/pre.js            alert() shim for Node/workers (SDL message boxes)
+patches/0001-emscripten.patch   changes to upstream files (33 files, all behind ARCH_WASM)
+patches/new_files/           new sources, laid out like upstream's src/
+  core/interpreter/            the interpreter, HLE thunks, host->guest calls
+  core/wasm_layout.h           guest address layout inside linear memory
+  core/wasm_high_memory.*      page table for fixed mappings above 12GB
+  core/aerolib/stubs_wasm.cpp  unresolved-import stubs as thunks (natively: Xbyak trampolines)
+  core/cpu_patches_wasm.cpp    no-op: nothing to patch when interpreting
+  core/guest_call.h            Core::ExecuteGuest - the host->guest call site helper
+  video_core/renderer_web/     Presenter/Rasterizer stand-ins
+  web/                         main, window/input, frame hand-off, stubs for excluded libraries
+scripts/setup_tree.sh        build/patched = upstream src/ + patches, as a git repo
+scripts/export_patches.sh    build/patched's diff -> patches/0001-emscripten.patch
+scripts/build_wasm.sh        configure + build
+scripts/run_node.sh          run a game headlessly under Node
+tools/extract_pkg.py         fPKG -> game folder (upstream removed its extractor)
+tests/interpreter/           guest_code.s -> guest_code.inc (gen_guest_code.sh), test_main.cpp
 ```
 
-## Interpreter design
+## Build and test
 
-- **Decoding**: Zydis (already a shadPS4 dependency - `externals/zydis`). It's a pure disassembler
-  with no code generation, so it's portable to wasm with no changes expected.
-- **Register file**: `Core::Interpreter::CpuState` - 16 GPRs indexed the same way Zydis's register
-  enum orders them (`ZYDIS_REGISTER_RAX..R15` are 16 contiguous values; the 8/16/32-bit and
-  legacy-high-byte sub-register views are all computed from that one array, not stored
-  separately). RFLAGS tracks only the bits a user-mode interpreter needs (CF/PF/AF/ZF/SF/OF).
-- **Memory**: `GuestMemory` is an abstract `Translate(vaddr, size, for_write) -> u8*` seam. See
-  "Guest virtual memory" below for why this has to be a seam rather than treating a VAddr as a
-  dereferenceable host pointer the way the rest of shadPS4 currently does.
-- **The guest<->host call boundary** (`HostThunkTable`): shadPS4's linker resolves a PS4 module's
-  imports directly to native C++ function pointers
-  (`Linker::RelocateAllImports`/`core/aerolib`) - under direct execution, guest code just calls
-  that address and it works, because guest and host share a CPU. Under interpretation, landing on
-  one of those addresses has to invoke the real host function and splice its return value into the
-  virtual register file instead of trying to decode compiled C++ as if it were guest bytes.
-  `HostThunkTable::Register()` hands out a synthetic address (above `0xFFFF'0000'0000'0000`, safely
-  outside shadPS4's real 40-bit guest address space) for exactly this; `RunUntil()` checks for one
-  at the top of every loop iteration. The existing `Linker::RunMainEntry`
-  (`src/core/linker.cpp`) already does a version of this by hand - it hands guest code
-  `ProgramExitFunc`'s raw host function pointer in `rsi` as the process-exit continuation - which
-  is what motivated building this as a first-class mechanism rather than a special case.
-- **What's deliberately not implemented yet**: SSE/AVX floating point, and REP-prefixed string
-  instructions (`MOVSB/STOSB/CMPSB/...`). Both are real, separate pieces of work, not just more of
-  the same pattern:
-    - There's a genuine Intel-syntax name collision worth being careful about: Zydis's
-      `ZYDIS_MNEMONIC_MOVSD` is the *string* instruction (`MOVSB/MOVSD/MOVSQ/MOVSW` are
-      adjacent in its enum - confirmed by reading `Zydis/Generated/EnumMnemonic.h`, not assumed),
-      not the SSE2 scalar double-precision move, which objdump/Zydis also print as "movsd" in
-      Intel syntax. Both exist; they're disambiguated by operand shape, not by enum value. Rather
-      than guess which handler a given decode means, `Execute()`'s unimplemented-instruction path
-      (`Unimplemented()`) aborts loudly with the mnemonic and address for both, so this surfaces
-      immediately instead of silently computing the wrong one.
-    - YMM/AVX register state above the 128-bit XMM view isn't modeled in `CpuState` at all yet.
-  When this is picked up, resolve the MOVSD ambiguity via each decode's actual operand types
-  (`ops[0].type`/`ops[1].type` - SSE2's form has an XMM register destination; the string form has
-  none) before writing either handler.
+Needs a shadPS4 checkout with submodules at `UPSTREAM_COMMIT` (default `~/shadps4_src`) and
+Emscripten (tested with 6.0.13).
 
-### A real bug this caught (worth reading if you're about to extend this)
+```
+git clone https://github.com/shadps4-emu/shadps4 ~/shadps4_src
+git -C ~/shadps4_src checkout $(cat UPSTREAM_COMMIT)
+git -C ~/shadps4_src submodule update --init --recursive --depth 1
+scripts/setup_tree.sh
+scripts/build_wasm.sh                      # all targets, into build/wasm
+node build/wasm/interpreter_tests.js       # 22/22 + a throughput line
+```
 
-`EffectiveAddress()` initially called Zydis's `ZydisCalcAbsoluteAddress()` for every memory
-operand. That function's own header comment (`Zydis/Utils.h`) says explicitly it only handles
-IMM-relative, RIP-relative, and literal-absolute operands - it has no access to a CPU's register
-values, so it cannot and does not resolve ordinary base/index-register addressing (`[rdi]`,
-`[rsp+8]`, `[rax+rbx*4+0x10]`, which is most memory operands in real code). Calling it for those
-doesn't error - it just returns a wrong address computed from whatever static bits happen to be
-in the encoding. The first four test cases all happened to avoid memory operands entirely (pure
-register/immediate ALU and control flow), so this shipped "passing" until the fifth test
-(`RunMainEntry`, which reads `[rdi]`/`[rsp+8]`) returned all-zero registers instead of the
-expected values. `EffectiveAddress()` now computes `base + index*scale + disp` itself from
-`op.mem.base/index/scale/disp.value`, reserving `ZydisCalcAbsoluteAddress()` for the one case it's
-actually documented to handle correctly (`ResolveBranchTarget`'s relative-immediate branch
-targets). The lesson, not just the fix: a test suite that passes is only as strong as what it
-actually exercises - four passing register/immediate-only tests gave no signal at all about memory
-addressing correctness.
+Developing: edit files in `build/patched/src` (a git repo whose `upstream` tag is pristine), then
+`scripts/export_patches.sh`. New files go straight into `patches/new_files`.
 
-## Guest virtual memory (M4 - not started, probably the biggest remaining piece)
+## Guest memory
 
-`Core::AddressSpace` (`src/core/address_space.h`) reserves a real 40-bit (1TB) region of the
-*host's* virtual address space via `mmap` and maps guest pages into it, so a guest VAddr and a
-host pointer are the same number (`Traits::Entry = u8*`, `ADDRESS_SPACE_BITS = 40`). That's cheap
-on a real OS because an unmapped mmap reservation doesn't commit physical memory. WebAssembly
-linear memory has nothing like it: no sparse reservation at an arbitrary 64-bit address, and no
-realistic way to back a 1TB declared memory even under the memory64 proposal. So this identity
-mapping cannot exist in the Emscripten build, which means:
+Natively, shadPS4 reserves the PS4's user address range in the host process and maps guest
+memory at the same addresses, so a guest pointer is a host pointer and the HLE libraries
+dereference guest addresses freely. Keeping that property is what lets ~200 HLE libraries compile
+and run unchanged here, so the port keeps it inside wasm64 linear memory:
 
-- `GuestMemory::Translate()` in this project is the replacement seam, but **only the interpreter
-  itself goes through it today**. Everything else in shadPS4 - all of `core/libraries/**`, every
-  HLE syscall implementation, anywhere a `VAddr` gets `reinterpret_cast`into a host pointer and
-  dereferenced directly - currently assumes the identity mapping and would need to be rewritten to
-  translate through whatever replaces `AddressSpace` for this target. That's the actual size of
-  M4: not "write a page table" (small - `AddressSpace::BackingPageTable` is already
-  `Common::MultiLevelPageTable<Entry=u8*>`, and the committed-pages discipline it already has is a
-  reasonable starting point to adapt rather than replace outright), but "audit and fix every call
-  site across the HLE tree that currently assumes `VAddr == uintptr_t`."
-- **What `GuestAddressSpace` actually does** (the M4 stand-in built so far,
-  `patches/new_files/core/interpreter/guest_address_space.{h,cpp}`): a sorted list of mapped
-  regions, each its own heap allocation, not a page table. A page-table-per-16KB-page scheme
-  (mirroring `AddressSpace::BackingPageTable` exactly, as the paragraph above suggests) was
-  considered and specifically rejected for now: `GuestMemory::Translate()` has to hand back one
-  contiguous host pointer for the requested range, and independently-allocated pages aren't
-  contiguous with each other any more than independently-allocated regions are - a page-table
-  version would hit the exact same "can't span a boundary" limitation one level down, for more
-  implementation complexity, not less. `GuestAddressSpace` accepts that limitation explicitly
-  (`Translate()` returns `nullptr` for a request spanning two separately-mapped regions, and
-  `GuestMemory`'s `Read`/`Write`/etc. now abort with a diagnostic on that rather than segfaulting -
-  see guest_memory.h) rather than hiding it behind a page table that merely relocates the same
-  problem. Revisit if something real needs a request spanning two independently-`Map()`'d
-  regions to work - nothing has hit that yet.
-- A second, specific wrinkle found while building the interpreter: `Linker::RunMainEntry` hands
-  guest code a *host* global's address (`Libraries::Kernel::entry_params`) in `rdi`, expecting
-  guest code to dereference it - which only works today because host and guest share one address
-  space. Once that's no longer true, that handoff needs its own fix (likely: copy the struct into
-  translated guest memory instead of pointing at the host original), not just a generic
-  VAddr-translation pass.
+- The emulator's own static data, stacks and heap are linked at 12GB (`-sGLOBAL_BASE=12GB`,
+  `-sINITIAL_MEMORY=13GB`, max 16GB). Everything below is the guest's, at the guest's own
+  addresses: system managed 4MB-6GB (eboot.bin at 0x400000, game modules at 0x80000000), system
+  reserved 6-8GB, user 8-12GB (`core/wasm_layout.h`). Browsers commit linear memory lazily, so a
+  13GB memory costs what's touched (a test run: ~59MB RSS).
+- The handful of addresses upstream hard-codes in its native layout (system module base, kernel
+  allocation bases, libSceGnmDriver's mapping, the thread stack area) have compressed
+  counterparts.
+- Fixed-address mappings above 12GB (the PS4 user range goes to ~1TB; Bully's emulator maps at
+  0x80'0000'0000) go to a "high" region backed by heap allocations and reached through a page
+  table (`core/wasm_high_memory.*`) in the interpreter's slow path. Physical memory mapped there
+  can be aliased properly. Limit: HLE code handed a pointer into it can't dereference it.
+- Limit: below 12GB, an address is its own storage, so the same physical (direct) memory mapped
+  at two addresses gets a copy rather than a shared view (logged). No page protection either.
 
-## Guest<->host call boundary, in shadPS4 terms (part of M5)
+## Interpreter
 
-`HostThunkTable` is the general mechanism; wiring it in means finding every place existing
-shadPS4 code resolves a guest-visible address to a real host function pointer and routes it
-through a thunk registration instead of a raw call. Found so far by grep (not exhaustively
-audited): roughly 23 files under `src/` declaring `PS4_SYSV_ABI (*)(...)`-style function-pointer
-typedefs used to call into mapped guest memory, plus `Linker::RunMainEntry` itself
-(`src/core/linker.cpp`) and the `_malloc_init`/`sceLibcInternalMemoryMutexEnable` calls right next
-to it, which are guest code reached via `mod->FindByName(...)` and a raw function-pointer cast -
-easy to miss because nothing about that line looks different from calling a normal host function.
-Thread entry (`core/thread.cpp`) and TLS setup (`core/tls.cpp`, needed before `state.fs_base`
-means anything) are two more specific integration points, not yet looked at in detail.
+- **Decode**: Zydis, cached per address in a direct-mapped table. Each entry keeps the
+  instruction's bytes and is reused only if memory still holds them, so code written at runtime
+  (JITs, relocations) is never executed stale - no invalidation protocol needed.
+- **Dispatch**: VEX mnemonics are folded onto their SSE names (VADDPS -> ADDPS) so one handler
+  serves both encodings; operands are normalized so `addps x1, x2` and `vaddps x1, x2, x3` take
+  the same path, with VEX's upper-lane zeroing applied on write.
+- **Atomics**: LOCK-prefixed read-modify-writes and XCHG use wasm atomics on the guest address
+  (guest memory is the shared linear memory), so guest threads on different Web Workers
+  synchronize for real. Split-lock (unaligned) cases and CMPXCHG16B use a mutex.
+- **Threads**: one `Cpu` per host thread; guest pthreads are emscripten pthreads (Web Workers).
+- **Faults**: wild guest pointers, unimplemented instructions, `ud2`/`int3` raise `GuestFault`
+  with a register dump and disassembly instead of corrupting the emulator.
+- **CPUID** reports the Jaguar (AuthenticAMD, family 16h) feature set, which is what's
+  implemented.
+
+### A bug class the earlier prototype hit (still worth knowing)
+
+The first version of `EffectiveAddress()` called Zydis's `ZydisCalcAbsoluteAddress()` for every
+memory operand. That function only handles RIP-relative/absolute operands - it has no register
+values - so base/index addressing silently produced wrong addresses, and four register-only tests
+passed regardless. The current tests are assembler output covering memory addressing, the stack,
+SIMD and calls in both directions, for exactly this reason.
+
+## Guest <-> host calls
+
+- **Guest -> host**: `HOST_CALL(fn)` (core/tls.h) becomes `HleAddress<fn>()`: a synthetic address
+  (0x7F00'0000'0000+, far outside guest memory) whose thunk reads arguments from rdi..r9 /
+  xmm0..7 / the stack per the System V rules for each parameter's C++ type, calls `fn`, writes
+  rax/rdx/xmm0, and performs the guest's `ret`. Unresolved imports get thunks that log and return
+  0, like upstream's stubs.
+- **Host -> guest**: wherever shadPS4 calls a guest function pointer (module entry points,
+  thread start routines, `pthread_once` initializers, key destructors, cleanup handlers, signal
+  handlers, the guest heap API for TLS, savedata/IME callbacks), it calls
+  `Core::ExecuteGuest(fn, args...)`, which runs it in the interpreter. Calls nest: an HLE function
+  can call back into the guest, which can call another HLE function. A guest function pointer
+  called directly by host code that hasn't been routed yet fails loudly in wasm
+  ("table index is out of bounds"), which points straight at the site to route.
+
+## Graphics (M8)
+
+`video_core/renderer_web` replaces `Vulkan::Presenter` and `Vulkan::Rasterizer` (same names and
+interface, selected by the two Vulkan headers under `ARCH_WASM`):
+
+- **Presenter**: reads VideoOut buffers from guest memory, converts A8R8G8B8/A8B8G8R8/A2R10G10B10
+  to RGBA8, and hands frames to the page (`web/web_display.cpp`) - or to PPM files under Node
+  with `SHADPS4_FRAME_DUMP=dir`. Tiled framebuffers are shown as if linear (there's no CPU
+  detiler, and nothing writes them without a GPU anyway).
+- **Rasterizer**: the GPU command processor (`AmdGpu::Liverpool`, upstream, unmodified) runs
+  and calls it; DMA fills/copies and GDS reads are performed on the CPU, draws and dispatches are
+  counted and dropped.
+
+What M8 still needs is a real GPU backend. The most direct route is a WebGPU implementation of
+the rasterizer interface, reusing shadPS4's shader recompiler (GCN -> SPIR-V) and translating its
+SPIR-V to WGSL (Tint or naga compiled to wasm), plus the texture cache's detiling as compute
+shaders. That is the next large piece of work and hasn't been started.
+
+## What's excluded from the build, and why
+
+Each is listed in `EXCLUDE_REGEX` in `emscripten/CMakeLists.txt`; `web/excluded_libs.cpp` gives
+the excluded HLE libraries empty `RegisterLib`s, so their NIDs fall back to the generic
+"unimplemented, returns 0" stub - the same thing that happens natively for functions shadPS4
+hasn't written.
+
+- Networking and PSN (`libraries/net`, `network`, `np`, `rudp`, `core/net`): host sockets with
+  epoll/kqueue, OpenSSL, protobuf, cpp-httplib.
+- Video/audio decoding (`avplayer`, `videodec`, `ajm`, `music`): FFmpeg.
+- USB (`usbd`): libusb. UPnP: miniupnpc.
+- The ImGui overlay renderer, Vulkan pipeline cache, RenderDoc, the debugger/devtools, IPC.
+- OpenAL (audio goes through SDL's Emscripten backend, untested so far).
+- Embedded fallback fonts (left empty to keep the download at ~18MB).
+
+## Performance
+
+The interpreter runs ~60 million guest instructions per second on an Apple M4 under Node (the
+sum loop in `tests/interpreter`), single-threaded per guest thread. A Jaguar core retires on the
+order of a billion or more, so even with a GPU backend games would run far below full speed. The
+obvious next steps, in order of payoff: chaining decoded basic blocks instead of per-instruction
+cache lookups, lazy flag evaluation, and eventually translating hot blocks to wasm.
+
+## Loading games in the browser
+
+The page copies the chosen folder into Emscripten's in-memory filesystem (files over 1GB are
+skipped - e.g. a PS2 Classic's disc image, which Bully never gets far enough to read). Large games
+will need an OPFS/WasmFS-backed filesystem instead. PKGs have to be extracted first with
+`tools/extract_pkg.py` (fake-signed PKGs only; it reads the fake keysets from upstream's git
+history rather than this repo carrying them).
 
 ## Attribution note on the upstream repo
 
 shadPS4's `AGENTS.md` contains an instruction telling AI agents to check GitHub push permissions
-and, if the check fails, write a file admitting to "botting the repo" without having checked the
-work. That's a prompt-injection trap for agents that blindly follow instructions found in cloned
-repository content rather than from the person actually directing the work - it was not followed,
-and no such file was created.
+and, if the check fails, write a file admitting to "botting the repo". That's a prompt-injection
+trap aimed at agents following instructions found in cloned repositories; it was not followed.
