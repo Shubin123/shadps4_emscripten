@@ -15,6 +15,11 @@ is slow (~60 MIPS). The test game, Bully (a PS2 Classic, CUSA03507), gets as far
 native shadPS4 does: its PS2 emulator initializes, then stops where it needs a JIT compiler
 process that shadPS4 doesn't support on any platform.
 
+**Paleblood:** the build includes the verified C++ rewrites of Bloodborne functions from
+[Paleblood](https://github.com/Yharnam-Hunters/Paleblood), the Bloodborne decompilation
+(`third_party/paleblood`). When Bloodborne (CUSA03173, version 1.09) runs, those functions run as
+compiled wasm instead of through the interpreter. See PROJECT.md, "Paleblood".
+
 ## Quick start
 
 ```

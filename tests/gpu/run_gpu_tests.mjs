@@ -18,6 +18,7 @@ var Module = {
   print: (s) => console.log(s),
   printErr: (s) => console.log(s),
   shadps4GpuDumpShaders: ${process.env.DUMP_SHADERS ? "true" : "false"},
+  shadps4Env: { SHADPS4_GPU_TEST_ENV: "page" },
 };
 </script><script src="gpu_tests.js"></script>`;
 

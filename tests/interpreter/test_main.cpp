@@ -6,12 +6,15 @@
 // bytes, so what's being checked is the interpreter's semantics rather than the test's encoding.
 
 #include <chrono>
+#include <cstddef>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include "core/interpreter/cpu.h"
 #include "core/interpreter/guest.h"
 #include "core/interpreter/hle.h"
+#include "core/paleblood/paleblood.h"
+#include "runtime/original.h"
 
 #include "guest_code.inc"
 
@@ -43,6 +46,38 @@ double HostCallback(int a, u64 table, double d) {
     // Called from guest code through an HLE thunk, and itself calls back into guest code.
     const int nested = CallGuest<int>(Fn(k_add), 1, 2);
     return a + d + nested + (table == kData ? 0.0 : 1000.0);
+}
+
+// A replacement written the way Paleblood's are (third_party/paleblood/game), against the
+// runtime interface this port implements on the interpreter: an original called by name, a
+// global, a vtable slot in guest memory and the guest thread pointer. The "executable" is the
+// test's code block, mapped as if at the PS4's 0x400000.
+constexpr u32 kPs4(u64 offset) {
+    return static_cast<u32>(0x400000 + offset);
+}
+constexpr u64 kPbGlobal = 0x80000; // inside the code block, past the code
+
+struct PbObject;
+struct PbVtable {
+    void* unknown_slot;
+    ::rt::guest_fn<int(PbObject*, int)> scale;
+};
+struct PbObject {
+    const PbVtable* vtable;
+    int bias;
+};
+static_assert(offsetof(PbVtable, scale) == 8 && offsetof(PbObject, bias) == 8);
+
+RT_ORIGINAL(kPs4(k_pb_square), pb_square, int(int));
+RT_GLOBAL(kPs4(kPbGlobal), pb_object, PbObject*);
+
+u64 pb_expected_thread_pointer = 0;
+
+extern "C" int pb_replacement(int a, int b) {
+    PbObject* object = pb_object.get();
+    const bool tp_ok =
+        reinterpret_cast<u64>(paleblood_guest_thread_pointer()) == pb_expected_thread_pointer;
+    return pb_square(a) + object->vtable->scale(object, b) + (tp_ok ? 0 : 1000);
 }
 
 } // namespace
@@ -116,6 +151,34 @@ int main() {
     Cpu::Current().State().fs_base = kData + 512;
     *reinterpret_cast<u64*>(kData + 512) = 0x1234567890ULL;
     Check(CallGuest<u64>(Fn(k_tls)) == 0x1234567890ULL, "fs-relative load (TLS)");
+
+    Check(CallGuest<u64>(Fn(k_sum8), 1, 2, 3, 4, 5, 6, 7, 8) == 36,
+          "host -> guest call with stack-passed integer arguments");
+    Check(CallGuest<double>(Fn(k_dsum9), 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0) == 45.0,
+          "host -> guest call with a stack-passed double");
+
+    // Paleblood: before the hook, f_pb_caller(5, 2) runs the original (3*5 + 2) + 5.
+    Check(CallGuest<int>(Fn(k_pb_caller), 5, 2) == 22, "paleblood: original before hooking");
+    auto* vtable = reinterpret_cast<PbVtable*>(kData + 640);
+    auto* object = reinterpret_cast<PbObject*>(kData + 672);
+    vtable->scale.address = Fn(k_pb_slot);
+    object->vtable = vtable;
+    object->bias = 7;
+    *reinterpret_cast<PbObject**>(kCode + kPbGlobal) = object;
+    pb_expected_thread_pointer = 0x1234567890ULL; // fs:[0], set up for the TLS check above
+    const Core::Paleblood::Hook hooks[] = {
+        {kPs4(k_pb_original), static_cast<u32>(k_pb_caller - k_pb_original), "pb_replacement",
+         [] { return HleThunk<&pb_replacement>::Address(); }},
+        {kPs4(k_add), static_cast<u32>(k_sum - k_add), "too short to hook",
+         [] { return HleThunk<&pb_replacement>::Address(); }},
+    };
+    const u32 installed =
+        Core::Paleblood::InstallHooks(reinterpret_cast<u8*>(kCode), 0x100000, hooks);
+    Check(installed == 1 && CallGuest<int>(Fn(k_add), 3, 4) == 7,
+          "paleblood: a function shorter than the jump isn't hooked");
+    // Now the replacement runs instead: 5*5 + 2*7 (vtable slot) + 5.
+    Check(CallGuest<int>(Fn(k_pb_caller), 5, 2) == 44,
+          "paleblood: replacement runs, calls an original, a global and a vtable slot");
 
     bool faulted = false;
     try {

@@ -30,7 +30,6 @@ u64 HostThreadStackTop() {
 
 void SetArgs(CpuState& s, const GuestArgs& args) {
     static constexpr u8 order[6] = {RDI, RSI, RDX, RCX, R8, R9};
-    ASSERT_MSG(args.ngp <= 6 && args.nvec <= 8, "guest call with stack-passed arguments");
     for (int i = 0; i < args.ngp; i++) {
         s.gpr[order[i]] = args.gp[i];
     }
@@ -60,6 +59,13 @@ GuestResult CallGuestRaw(u64 addr, const GuestArgs& args) {
         sp = HostThreadStackTop();
     }
     sp &= ~u64{15};
+    // Stack-passed arguments sit just above the return address, the first one at the 16-byte
+    // aligned rsp the call is made from.
+    ASSERT_MSG(args.nstack <= GuestArgs::kMaxStack, "guest call with too many arguments");
+    sp -= (static_cast<u64>(args.nstack) * 8 + 15) & ~u64{15};
+    for (int i = 0; i < args.nstack; i++) {
+        std::memcpy(reinterpret_cast<void*>(sp + i * 8), &args.stack[i], sizeof(u64));
+    }
     s.gpr[RSP] = sp;
     SetArgs(s, args);
     s.gpr[RAX] = static_cast<u64>(args.nvec); // what a varargs callee expects in al

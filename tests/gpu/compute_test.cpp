@@ -186,6 +186,10 @@ void TestDivergentLoopWithBarrier(std::span<u32> gds) {
 
 int main() {
     Common::Log::Setup("gpu_tests.log"); // the page's console gets the emulator's log too
+    // The page hands environment variables in as Module.shadps4Env (emscripten/pre.js), the way
+    // shadps4_web's ?env= does; main runs on a pthread here, as in the emulator.
+    const char* env = std::getenv("SHADPS4_GPU_TEST_ENV");
+    Check("environment from the page reaches getenv", env && std::strcmp(env, "page") == 0);
     if (!Web::Gpu::Available()) {
         std::printf("GPU TESTS: no WebGPU device\n");
         return 2;

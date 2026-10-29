@@ -7,35 +7,66 @@
 
 #pragma once
 
+#include <cstring>
 #include <type_traits>
 #include "common/types.h"
 #include "core/interpreter/cpu.h"
 
 namespace Core::Interpreter {
 
-// Arguments for one guest call, assigned per the System V ABI as they're added.
+// Arguments for one guest call, assigned per the System V ABI as they're added: the first six
+// integer-class arguments in registers, the first eight float ones in xmm registers, and the
+// rest in 8-byte stack slots in argument order.
 struct GuestArgs {
+    static constexpr int kMaxStack = 16;
+
     u64 gp[6]{};
     int ngp{};
     Vec vec[8]{};
     int nvec{};
+    u64 stack[kMaxStack]{};
+    int nstack{};
 
     template <typename T>
     void Add(T v) {
         using U = std::remove_cvref_t<T>;
-        if constexpr (std::is_same_v<U, float>) {
-            vec[nvec] = {};
-            vec[nvec++].f[0] = v;
-        } else if constexpr (std::is_same_v<U, double>) {
-            vec[nvec] = {};
-            vec[nvec++].fd[0] = v;
+        if constexpr (std::is_same_v<U, float> || std::is_same_v<U, double>) {
+            Vec slot{};
+            if constexpr (std::is_same_v<U, float>) {
+                slot.f[0] = v;
+            } else {
+                slot.fd[0] = v;
+            }
+            if (nvec < 8) {
+                vec[nvec++] = slot;
+            } else {
+                u64 bits;
+                std::memcpy(&bits, &slot, sizeof(bits));
+                AddStack(bits);
+            }
         } else if constexpr (std::is_pointer_v<U> || std::is_null_pointer_v<U>) {
-            gp[ngp++] = reinterpret_cast<u64>(v);
+            AddGp(reinterpret_cast<u64>(v));
         } else {
             static_assert(std::is_integral_v<U> || std::is_enum_v<U>,
                           "only integer, pointer and float arguments are passed to guest code");
-            gp[ngp++] = static_cast<u64>(v);
+            AddGp(static_cast<u64>(v));
         }
+    }
+
+private:
+    void AddGp(u64 v) {
+        if (ngp < 6) {
+            gp[ngp++] = v;
+        } else {
+            AddStack(v);
+        }
+    }
+    // Counted even past kMaxStack, so CallGuestRaw can refuse the call.
+    void AddStack(u64 v) {
+        if (nstack < kMaxStack) {
+            stack[nstack] = v;
+        }
+        nstack++;
     }
 };
 

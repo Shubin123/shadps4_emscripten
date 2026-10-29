@@ -955,21 +955,22 @@ index 9a50825..85ef4f7 100644
      if (size < name.length() + 1) {
          LOG_ERROR(Lib_UserService, "buffer is too short");
 diff --git a/src/core/linker.cpp b/src/core/linker.cpp
-index 44d216d..cb9e4c8 100644
+index 44d216d..468e6db 100644
 --- a/src/core/linker.cpp
 +++ b/src/core/linker.cpp
-@@ -1,6 +1,10 @@
+@@ -1,6 +1,11 @@
  // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
  // SPDX-License-Identifier: GPL-2.0-or-later
  
 +#include "common/arch.h"
 +#ifdef ARCH_WASM
++#include "core/paleblood/paleblood.h"
 +#include "core/wasm_layout.h"
 +#endif
  #include "common/alignment.h"
  #include "common/arch.h"
  #include "common/assert.h"
-@@ -23,10 +27,13 @@
+@@ -23,10 +28,13 @@
  #include "core/libraries/libc_internal/libc_internal.h"
  #include "core/libraries/sysmodule/sysmodule.h"
  #include "core/libraries/sysmodule/sysmodule_internal.h"
@@ -983,7 +984,7 @@ index 44d216d..cb9e4c8 100644
  
  #ifndef _WIN32
  #include <signal.h>
-@@ -59,6 +66,11 @@ static PS4_SYSV_ABI void* RunMainEntry [[noreturn]](EntryParams* params) {
+@@ -59,6 +67,11 @@ static PS4_SYSV_ABI void* RunMainEntry [[noreturn]](EntryParams* params) {
                   : "r"(params->entry_addr), "r"(params), "r"(ProgramExitFunc)
                   : "rax", "rsi", "rdi");
      UNREACHABLE();
@@ -995,7 +996,7 @@ index 44d216d..cb9e4c8 100644
  #else
      UNREACHABLE_MSG("RunMainEntry unimplemented for current architecture.");
  #endif
-@@ -154,9 +166,11 @@ void Linker::Execute(const std::vector<std::string>& args) {
+@@ -154,9 +167,11 @@ void Linker::Execute(const std::vector<std::string>& args) {
          sigemptyset(&emptyset);
          pthread_sigmask(SIG_SETMASK, &emptyset, nullptr);
  #endif
@@ -1007,7 +1008,7 @@ index 44d216d..cb9e4c8 100644
  
          // Load libSceLibcInternal, run malloc_init.
          if (has_libcinternal) {
-@@ -164,9 +178,9 @@ void Linker::Execute(const std::vector<std::string>& args) {
+@@ -164,9 +179,9 @@ void Linker::Execute(const std::vector<std::string>& args) {
  
              if (malloc_init && sceLibcInternalMemoryMutexEnable) {
                  // Call _malloc_init
@@ -1019,7 +1020,7 @@ index 44d216d..cb9e4c8 100644
              }
          }
  
-@@ -197,7 +211,11 @@ void Linker::Execute(const std::vector<std::string>& args) {
+@@ -197,7 +212,11 @@ void Linker::Execute(const std::vector<std::string>& args) {
          s32 result = Libraries::Kernel::sceKernelAllocateDirectMemory(
              0, Libraries::Kernel::sceKernelGetDirectMemorySize(), 0x10000, 0x10000, 3, &phys_addr);
          if (result == 0) {
@@ -1031,7 +1032,22 @@ index 44d216d..cb9e4c8 100644
              result = Libraries::Kernel::sceKernelMapNamedDirectMemory(
                  &addr, 0x10000, 0x13, 0, phys_addr, 0x10000, "SceGnmDriver");
          }
-@@ -249,7 +267,9 @@ s32 Linker::LoadModule(const std::filesystem::path& elf_name, bool is_dynamic) {
+@@ -211,6 +230,14 @@ void Linker::Execute(const std::vector<std::string>& args) {
+             params.argv[i] = args[i].c_str();
+         }
+ 
++#ifdef ARCH_WASM
++        // Game function replacements compiled into the build (Paleblood), now that every module
++        // is loaded and relocated and before any of the game's own code runs.
++        Core::Paleblood::OnGameLoaded(module->GetBaseAddress(), module->aligned_base_size,
++                                      Common::ElfInfo::Instance().GameSerial(),
++                                      Common::ElfInfo::Instance().AppVer());
++#endif
++
+         // Run the game's entry function
+         params.entry_addr = module->GetEntryAddress();
+         RunMainEntry(&params);
+@@ -249,7 +276,9 @@ s32 Linker::LoadModule(const std::filesystem::path& elf_name, bool is_dynamic) {
      num_static_modules += !is_dynamic;
      m_modules.emplace_back(std::move(module));
  
@@ -1041,7 +1057,7 @@ index 44d216d..cb9e4c8 100644
  
      return mod_id;
  }
-@@ -491,7 +511,7 @@ void* Linker::TlsGetAddr(u64 module_index, u64 offset) {
+@@ -491,7 +520,7 @@ void* Linker::TlsGetAddr(u64 module_index, u64 offset) {
          const u32 init_image_size = module->tls.init_image_size;
          u8* dest{};
          if (heap_api && heap_api->heap_malloc) {
@@ -1050,7 +1066,7 @@ index 44d216d..cb9e4c8 100644
          } else {
              dest = reinterpret_cast<u8*>(std::malloc(module->tls.image_size));
          }
-@@ -512,7 +532,11 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
+@@ -512,7 +541,11 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
      // If sceKernelMapNamedFlexibleMemory is being called from libkernel and addr = 0
      // it automatically places mappings in system reserved area instead of managed.
      // Since the system reserved area already has a mapping in it, this address is slightly higher.
@@ -1062,7 +1078,7 @@ index 44d216d..cb9e4c8 100644
  
      // The kernel module has a few different paths for TLS allocation.
      // For SDK < 1.7 it allocates both main and secondary thread blocks using libc mspace/malloc.
-@@ -526,7 +550,7 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
+@@ -526,7 +559,7 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
          ASSERT_MSG(ret == 0, "Unable to allocate TLS+TCB for the primary thread");
      } else {
          if (heap_api && heap_api->heap_malloc) {
@@ -1071,7 +1087,7 @@ index 44d216d..cb9e4c8 100644
          } else {
              addr_out = std::malloc(total_tls_size);
          }
-@@ -536,7 +560,7 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
+@@ -536,7 +569,7 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
  
  void Linker::FreeTlsForNonPrimaryThread(void* pointer) {
      if (heap_api && heap_api->heap_free) {

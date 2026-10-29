@@ -9,7 +9,7 @@
 # meaning in a browser (libusb, miniupnpc, discord-rpc, openal-soft's native backends, the Vulkan
 # loader, ...), and the ones that do are either header-only or have an Emscripten port.
 #
-#   emcmake cmake -S emscripten -B build/wasm -G Ninja -DSHADPS4_SRC_DIR=~/shadps4_src
+#   emcmake cmake -S emscripten -B build/wasm -G Ninja -DSHADPS4_SRC_DIR=../upstream_native/shadps4
 #   cmake --build build/wasm
 
 cmake_minimum_required(VERSION 3.24)
@@ -24,7 +24,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
-set(SHADPS4_SRC_DIR "$ENV{HOME}/shadps4_src" CACHE PATH "shadPS4 checkout with submodules")
+set(SHADPS4_SRC_DIR "${REPO_ROOT}/../upstream_native/shadps4" CACHE PATH "shadPS4 checkout with submodules")
 set(PATCHED_SRC "${REPO_ROOT}/build/patched/src" CACHE PATH "Patched upstream src/")
 set(NEW_FILES "${REPO_ROOT}/patches/new_files")
 set(EXT "${SHADPS4_SRC_DIR}/externals")
@@ -165,6 +165,36 @@ endforeach()
 file(GLOB_RECURSE NEW_SOURCES CONFIGURE_DEPENDS "${NEW_FILES}/*.cpp")
 list(FILTER NEW_SOURCES EXCLUDE REGEX "/web/main_web\\.cpp$")
 
+# Paleblood's game function replacements (third_party/paleblood, see core/paleblood/paleblood.h):
+# tools/paleblood_port.py copies them into the build tree with the changes interpretation needs
+# and generates their hook table. They're compiled against this port's runtime interface headers
+# (core/paleblood/port), with Paleblood's own floating-point rules: no contraction, no fast-math.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(PALEBLOOD_DIR "${REPO_ROOT}/third_party/paleblood")
+set(PALEBLOOD_OUT "${CMAKE_CURRENT_BINARY_DIR}/paleblood")
+file(GLOB_RECURSE PALEBLOOD_FILES RELATIVE "${PALEBLOOD_DIR}" CONFIGURE_DEPENDS
+     "${PALEBLOOD_DIR}/game/*.cpp" "${PALEBLOOD_DIR}/game/*.c" "${PALEBLOOD_DIR}/game/*.h")
+set(PALEBLOOD_INPUTS "${PALEBLOOD_DIR}/game/hooks.csv" "${PALEBLOOD_DIR}/symbols/functions.csv")
+set(PALEBLOOD_OUTPUTS "${PALEBLOOD_OUT}/paleblood_hooks.cpp")
+set(PALEBLOOD_GAME_SOURCES)
+foreach(f IN LISTS PALEBLOOD_FILES)
+    list(APPEND PALEBLOOD_INPUTS "${PALEBLOOD_DIR}/${f}")
+    list(APPEND PALEBLOOD_OUTPUTS "${PALEBLOOD_OUT}/${f}")
+    if(f MATCHES "\\.cpp$")
+        list(APPEND PALEBLOOD_GAME_SOURCES "${PALEBLOOD_OUT}/${f}")
+    endif()
+endforeach()
+add_custom_command(
+    OUTPUT ${PALEBLOOD_OUTPUTS}
+    COMMAND "${Python3_EXECUTABLE}" "${REPO_ROOT}/tools/paleblood_port.py" "${PALEBLOOD_DIR}"
+            "${PALEBLOOD_OUT}"
+    DEPENDS "${REPO_ROOT}/tools/paleblood_port.py" ${PALEBLOOD_INPUTS}
+    COMMENT "Porting Paleblood's game replacements")
+set_source_files_properties(${PALEBLOOD_GAME_SOURCES} PROPERTIES
+    INCLUDE_DIRECTORIES "${NEW_FILES}/core/paleblood/port"
+    COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math;-msse4.1")
+list(APPEND NEW_SOURCES ${PALEBLOOD_GAME_SOURCES} "${PALEBLOOD_OUT}/paleblood_hooks.cpp")
+
 set(SCM_REV_IN "${PATCHED_SRC}/common/scm_rev.cpp.in")
 file(READ "${REPO_ROOT}/UPSTREAM_COMMIT" GIT_REV)
 string(STRIP "${GIT_REV}" GIT_REV)
@@ -210,6 +240,8 @@ set(SHADPS4_LINK_FLAGS
     -sEXPORTED_RUNTIME_METHODS=callMain,FS,UTF8ToString,HEAPU8
     -sEXPORTED_FUNCTIONS=_main,_shadps4_display_release,_shadps4_pad_button,_shadps4_pad_axis,_shadps4_request_quit
     -sMALLOC=mimalloc
+    # pre.js fills ENV (getenv's environment) before main.
+    "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$ENV"
     --profiling-funcs
     -Wl,--error-limit=0)
 
@@ -224,7 +256,7 @@ add_executable(shadps4 "${NEW_FILES}/web/main_web.cpp")
 target_link_libraries(shadps4 PRIVATE shadps4_core)
 # webgpu.js gives the page's WebGPU device to the renderer (video_core/renderer_web/web_gpu.h).
 set(WEBGPU_LINK_FLAGS "--pre-js=${CMAKE_CURRENT_LIST_DIR}/webgpu.js"
-    "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$addRunDependency,$removeRunDependency")
+    "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$ENV,$addRunDependency,$removeRunDependency")
 target_link_options(shadps4 PRIVATE ${SHADPS4_LINK_FLAGS} -sINVOKE_RUN=0 -sMODULARIZE=1
                     -sEXPORT_NAME=createShadPS4 -sENVIRONMENT=web,worker
                     "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js" ${WEBGPU_LINK_FLAGS})
@@ -232,7 +264,8 @@ target_link_options(shadps4 PRIVATE ${SHADPS4_LINK_FLAGS} -sINVOKE_RUN=0 -sMODUL
 # Interpreter tests (tests/interpreter): `node build/wasm/interpreter_tests.js`.
 add_executable(interpreter_tests "${REPO_ROOT}/tests/interpreter/test_main.cpp")
 target_link_libraries(interpreter_tests PRIVATE shadps4_core)
-target_include_directories(interpreter_tests PRIVATE "${REPO_ROOT}/tests/interpreter")
+target_include_directories(interpreter_tests PRIVATE "${REPO_ROOT}/tests/interpreter"
+                           "${NEW_FILES}/core/paleblood/port")
 target_link_options(interpreter_tests PRIVATE ${SHADPS4_LINK_FLAGS} -sNODERAWFS=1 -sEXIT_RUNTIME=1
                     -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js")
 

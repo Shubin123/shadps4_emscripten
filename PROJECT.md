@@ -19,7 +19,7 @@ browser exposes Vulkan.
 |---|---|---|
 | M1 | x86-64 interpreter | **Done for what the PS4's Jaguar implements**: integer, x87, SSE-SSE4.2, AVX (no AVX2/FMA, as on Jaguar), F16C, BMI1, LZCNT/POPCNT, MOVBE, AES-NI, PCLMULQDQ. ~60 MIPS on an Apple M4 (see Performance) |
 | M2 | Guest -> host calls (HLE) | **Done**: every `LIB_FUNCTION` gets a synthetic address; its SysV-ABI argument marshalling is generated from the C++ signature (`interpreter/hle.h`), including variadic functions via `VA_CTX` |
-| M3 | Tests | **Done**: 22 checks against assembler-generated x86-64 (`tests/interpreter`), run under Node |
+| M3 | Tests | **Done**: 27 checks against assembler-generated x86-64 (`tests/interpreter`), run under Node |
 | M4 | Guest virtual memory | **Done**, with two documented limits (see Guest memory): no aliasing below 12GB, and HLE code can't dereference pointers into the translated high region |
 | M5 | Wiring into shadPS4 | **Done for everything a game hits on boot**: `RunMainEntry`, module start, threads (`_runOnAnotherStack`), TLS (`fs:`), `pthread_once`/cleanup/key destructors, guest signal handlers, guest malloc for TLS, savedata/IME callbacks. Other guest callbacks (fonts, ngs2, AvPlayer, ...) are routed the same way (`Core::ExecuteGuest`) as they turn up |
 | M6 | Emscripten/CMake build | **Done**: `emscripten/CMakeLists.txt` compiles upstream shadPS4's own sources (common, core, ~200 HLE libraries, the GPU command processor) for wasm64 + pthreads; Node and browser targets |
@@ -58,7 +58,8 @@ cd ../shadps4_web && node tests/e2e.mjs ../games/ps4/CUSA03507 "IOP Flat Memory"
 UPSTREAM_COMMIT              shadPS4 commit the patch is made against (0614ce32)
 emscripten/CMakeLists.txt    the wasm build (targets: shadps4, shadps4_node, interpreter_tests,
                              translate_shaders, gpu_tests)
-emscripten/pre.js            alert() shim for Node/workers (SDL message boxes)
+emscripten/pre.js            alert() shim for Node/workers (SDL message boxes); a page's
+                             environment variables (Module.shadps4Env) for getenv
 emscripten/webgpu.js         the page-side WebGPU device and compute job executor
 patches/0001-emscripten.patch   changes to upstream files (35 files, all behind ARCH_WASM)
 patches/new_files/           new sources, laid out like upstream's src/
@@ -68,6 +69,8 @@ patches/new_files/           new sources, laid out like upstream's src/
   core/aerolib/stubs_wasm.cpp  unresolved-import stubs as thunks (natively: Xbyak trampolines)
   core/cpu_patches_wasm.cpp    no-op: nothing to patch when interpreting
   core/guest_call.h            Core::ExecuteGuest - the host->guest call site helper
+  core/paleblood/              Paleblood's game function replacements: hook installer, and the
+                               runtime interface they're written against, on the interpreter
   shader_recompiler/backend/wgsl/   IR -> WGSL (the SPIR-V backend's counterpart)
   video_core/renderer_web/     Presenter/Rasterizer stand-ins, WebGPU bridge, compute pipelines
   web/                         main, window/input, frame hand-off, stubs for excluded libraries
@@ -75,7 +78,10 @@ scripts/setup_tree.sh        build/patched = upstream src/ + patches, as a git r
 scripts/export_patches.sh    build/patched's diff -> patches/0001-emscripten.patch
 scripts/build_wasm.sh        configure + build
 scripts/run_node.sh          run a game headlessly under Node
+scripts/sync_paleblood.sh    Paleblood checkout -> third_party/paleblood
+third_party/paleblood/       Paleblood (Bloodborne decompilation), the parts the build compiles
 tools/extract_pkg.py         fPKG -> game folder (upstream removed its extractor)
+tools/paleblood_port.py      third_party/paleblood -> build tree, ported for interpretation
 tests/interpreter/           guest_code.s -> guest_code.inc (gen_guest_code.sh), test_main.cpp
 tests/shaders/               a game's GCN shaders -> WGSL -> WebGPU validation
 tests/gpu/                   hand-assembled GCN compute programs dispatched on WebGPU
@@ -92,7 +98,7 @@ git -C ~/shadps4_src checkout $(cat UPSTREAM_COMMIT)
 git -C ~/shadps4_src submodule update --init --recursive --depth 1
 scripts/setup_tree.sh
 scripts/build_wasm.sh                      # all targets, into build/wasm
-node build/wasm/interpreter_tests.js       # 22/22 + a throughput line
+node build/wasm/interpreter_tests.js       # 27/27 + a throughput line
 tests/shaders/run_shader_tests.sh ../games/ps4/CUSA03507/eboot.bin   # WGSL for a game's shaders
 node tests/gpu/run_gpu_tests.mjs           # WebGPU compute, in headless Chromium
 ```
@@ -161,9 +167,48 @@ SIMD and calls in both directions, for exactly this reason.
   thread start routines, `pthread_once` initializers, key destructors, cleanup handlers, signal
   handlers, the guest heap API for TLS, savedata/IME callbacks), it calls
   `Core::ExecuteGuest(fn, args...)`, which runs it in the interpreter. Calls nest: an HLE function
-  can call back into the guest, which can call another HLE function. A guest function pointer
-  called directly by host code that hasn't been routed yet fails loudly in wasm
+  can call back into the guest, which can call another HLE function. Arguments past the six
+  integer and eight vector registers go on the guest stack, as the ABI places them. A guest
+  function pointer called directly by host code that hasn't been routed yet fails loudly in wasm
   ("table index is out of bounds"), which points straight at the site to route.
+
+## Paleblood: compiled game functions (Bloodborne)
+
+[Paleblood](https://github.com/Yharnam-Hunters/Paleblood) is a functional decompilation of
+Bloodborne (CUSA03173, version 1.09): game functions rewritten as readable C++, each one proven
+upstream to behave exactly like the original machine code. Paleblood runs them natively, on its
+own Linux runtime, by writing a jump at each original's entry. It is GPL-2.0-or-later like
+shadPS4, and the parts that compile here are vendored in `third_party/paleblood`, unchanged.
+
+Paleblood's own runtime doesn't carry over. It is a native x86-64 Linux loader and system
+library layer, a different solution to what shadPS4's linker and HLE libraries already do here.
+What does carry over is the replacements: for an interpreter, every one is a game function that
+runs as compiled wasm instead of being interpreted one x86 instruction at a time. The
+`BB_LIMITER_WAIT=sleep` option also stops the frame limiter spinning a guest thread (and the
+interpreter with it) through the rest of each frame.
+
+- **Installing**: once the executable is loaded and relocated, and only for CUSA03173 version
+  01.09 (other versions put the code elsewhere), `core/paleblood` writes the same 14-byte
+  `jmp [rip+0]` Paleblood writes natively at each original's entry. Here it jumps to the
+  replacement's HLE thunk, which marshals the arguments from the guest registers and returns
+  to the original caller. Functions shorter than the jump are left alone, and `BB_HOOK_SKIP`
+  works as upstream. `SHADPS4_PALEBLOOD=0` turns the replacements off.
+- **Their view of the game**: the replacements reach the rest of the game by name through
+  Paleblood's runtime interface (`RT_ORIGINAL`, `RT_GLOBAL`). The port implements it on the
+  interpreter (`core/paleblood/port/runtime`): a call to an original runs in the interpreter,
+  nested on the calling guest thread, and a global is plain memory, since guest addresses are
+  linear-memory addresses here.
+- **Build-time changes**: `tools/paleblood_port.py` makes two kinds of change, in a copy in the
+  build tree. Vtable slots become `rt::guest_fn` (the same 8 bytes, called through the
+  interpreter, because the target is x86 and not a wasm function). The thread-pointer read
+  (`movq %gs:0`) becomes a read of the guest thread's `fs:[0]`. Anything in a form the script
+  doesn't recognize stops the build.
+- **Tested**: `tests/interpreter` hooks a guest function with a replacement written the
+  Paleblood way. It checks that callers reach the replacement and that the replacement can call
+  an original, read a global, call through a vtable slot in guest memory and read the thread
+  pointer. It also checks that a function too short for the jump is left alone. The 32
+  replacements themselves compile into the build, but running them takes Bloodborne, which this
+  repository doesn't test with.
 
 ## Graphics (M8)
 
@@ -251,7 +296,8 @@ hasn't written.
 ## Performance
 
 The interpreter runs ~60 million guest instructions per second on an Apple M4 under Node (the
-sum loop in `tests/interpreter`), single-threaded per guest thread. A Jaguar core retires on the
+sum loop in `tests/interpreter`), single-threaded per guest thread. Game functions with a
+Paleblood replacement are the exception: they run as compiled wasm. A Jaguar core retires on the
 order of a billion or more, so even with a GPU backend games would run far below full speed. The
 obvious next steps, in order of payoff: chaining decoded basic blocks instead of per-instruction
 cache lookups, lazy flag evaluation, and eventually translating hot blocks to wasm.

@@ -107,3 +107,48 @@ f_hle: push rbx
 4: .quad 0x4004000000000000
 f_tls: mov rax, qword ptr fs:[0]
  ret
+f_sum8: lea rax, [rdi + rsi]
+ add rax, rdx
+ add rax, rcx
+ add rax, r8
+ add rax, r9
+ add rax, qword ptr [rsp + 8]
+ add rax, qword ptr [rsp + 16]
+ ret
+f_dsum9: addsd xmm0, xmm1
+ addsd xmm0, xmm2
+ addsd xmm0, xmm3
+ addsd xmm0, xmm4
+ addsd xmm0, xmm5
+ addsd xmm0, xmm6
+ addsd xmm0, xmm7
+ addsd xmm0, qword ptr [rsp + 8]
+ ret
+// Paleblood hooks: f_pb_original (3a + b) is the function a replacement takes over; it's longer
+// than the 14-byte jump the hook writes. f_pb_caller calls it the way game code would.
+f_pb_original: lea eax, [rdi + rdi*2]
+ add eax, esi
+ nop
+ nop
+ nop
+ nop
+ nop
+ nop
+ nop
+ nop
+ nop
+ ret
+f_pb_caller: push rbx
+ mov ebx, edi
+ call f_pb_original
+ add eax, ebx
+ pop rbx
+ ret
+// An original the replacement calls by name (RT_ORIGINAL): a * a.
+f_pb_square: mov eax, edi
+ imul eax, edi
+ ret
+// A vtable slot the replacement calls (rt::guest_fn): b * object->bias.
+f_pb_slot: mov eax, esi
+ imul eax, dword ptr [rdi + 8]
+ ret
