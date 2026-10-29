@@ -3,8 +3,9 @@
 //
 // Stands in for Vulkan::Rasterizer (video_core/renderer_vulkan/vk_rasterizer.h) in the wasm build,
 // with the same name and the same public interface Liverpool and Core::MemoryManager call, so
-// neither needs to change. There is no GPU backend behind it yet (see PROJECT.md, M8): draws and
-// dispatches are counted and dropped. The CP DMA operations Liverpool forwards here
+// neither needs to change. Compute dispatches run on WebGPU when the page has a device
+// (web_compute.h); draws are counted and dropped until the graphics pipeline path exists (see
+// PROJECT.md, M8). The CP DMA operations Liverpool forwards here
 // (FillBuffer/CopyBuffer/ReadDataFromGds) are real work on guest memory, though - games use them
 // for ordinary copies and fence writes, so they are carried out on the CPU instead of skipped.
 
@@ -18,6 +19,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 #include "common/types.h"
+#include "video_core/renderer_web/web_compute.h"
 
 // The real vk_rasterizer.h pulls in a large include tree, and some of its includers (memory.cpp,
 // liverpool.cpp) rely on <shared_mutex>/boost small_vector arriving through it transitively -
@@ -25,6 +27,7 @@
 
 namespace AmdGpu {
 struct Liverpool;
+struct ComputeProgram;
 }
 
 namespace Vulkan {
@@ -32,6 +35,7 @@ namespace Vulkan {
 struct RasterizerStats {
     std::atomic<u64> draws{};
     std::atomic<u64> dispatches{};
+    std::atomic<u64> dispatches_run{}; // on WebGPU; the rest were dropped
     std::atomic<u64> dma_copies{};
     std::atomic<u64> dma_fills{};
     std::atomic<u64> submits{};
@@ -89,8 +93,11 @@ public:
     }
 
 private:
+    void Dispatch(const AmdGpu::ComputeProgram& cs, std::array<u32, 3> groups);
+
     AmdGpu::Liverpool* liverpool;
     RasterizerStats stats;
+    Web::ComputePipelines compute;
     // Global Data Share: 64KB of on-chip GPU memory addressed by dword index.
     std::array<u32, 0x10000 / sizeof(u32)> gds{};
 };

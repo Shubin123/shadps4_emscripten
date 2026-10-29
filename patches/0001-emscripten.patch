@@ -11,10 +11,18 @@ index b22366c..888c098 100644
 +#define ARCH_WASM 1
  #endif
 diff --git a/src/common/assert.cpp b/src/common/assert.cpp
-index a2b941a..4b51d51 100644
+index a2b941a..1aef9e3 100644
 --- a/src/common/assert.cpp
 +++ b/src/common/assert.cpp
-@@ -10,6 +10,8 @@
+@@ -3,6 +3,7 @@
+ 
+ #include "common/arch.h"
+ #include "common/assert.h"
++#include "common/logging/log.h"
+ #include "core/signals.h"
+ #include "emulator.h"
+ 
+@@ -10,13 +11,21 @@
  #define Crash() __asm__ __volatile__("int $3")
  #elif defined(ARCH_ARM64)
  #define Crash() __asm__ __volatile__("brk 0")
@@ -23,6 +31,19 @@ index a2b941a..4b51d51 100644
  #else
  #error "Missing Crash() implementation for target CPU architecture."
  #endif
+ 
+ void assert_fail_impl() {
++#ifdef ARCH_WASM
++    // No signal handlers to remove, and an orderly emulator shutdown from whichever worker hit
++    // the assertion can itself assert (e.g. when the emulator never started) and hang there.
++    Common::Log::Flush();
++#else
+     Core::Signals::Instance()->RemoveHandlers();
+     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
++#endif
+     Crash();
+ }
+ 
 diff --git a/src/common/rdtsc.h b/src/common/rdtsc.h
 index 4e4d584..0b02004 100644
 --- a/src/common/rdtsc.h
@@ -1327,6 +1348,43 @@ index 072a1cf..5ffb1a2 100644
  }
  
  void Emulator::UpdatePlayTime(const std::string_view serial) {
+diff --git a/src/shader_recompiler/info.h b/src/shader_recompiler/info.h
+index 75dcac5..47fe72d 100644
+--- a/src/shader_recompiler/info.h
++++ b/src/shader_recompiler/info.h
+@@ -6,6 +6,7 @@
+ #include <span>
+ #include <vector>
+ #include <boost/container/static_vector.hpp>
++#include "core/guest_call.h"
+ #include "common/assert.h"
+ #include "common/types.h"
+ #include "shader_recompiler/backend/bindings.h"
+@@ -169,7 +170,8 @@ struct Info : InfoPersistent {
+         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
+         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+         if (srt_info.walker_func) {
+-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
++            Core::ExecuteGuest(srt_info.walker_func, user_data.data(),
++                               flattened_ud_buf.data());
+         }
+     }
+ 
+diff --git a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
+index 67d361a..0ada685 100644
+--- a/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
++++ b/src/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp
+@@ -23,7 +23,9 @@
+ #include "shader_recompiler/ir/srt_gvn_table.h"
+ #include "shader_recompiler/ir/value.h"
+ 
+-#ifdef ARCH_X86_64
++// The wasm build generates the same x86-64 walker; it runs in the interpreter (Info::RefreshFlatBuf
++// calls it through Core::ExecuteGuest).
++#if defined(ARCH_X86_64) || defined(ARCH_WASM)
+ 
+ using namespace Xbyak::util;
+ 
 diff --git a/src/video_core/renderer_vulkan/vk_presenter.h b/src/video_core/renderer_vulkan/vk_presenter.h
 index 946e522..8442c0a 100644
 --- a/src/video_core/renderer_vulkan/vk_presenter.h

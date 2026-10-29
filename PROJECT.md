@@ -24,7 +24,7 @@ browser exposes Vulkan.
 | M5 | Wiring into shadPS4 | **Done for everything a game hits on boot**: `RunMainEntry`, module start, threads (`_runOnAnotherStack`), TLS (`fs:`), `pthread_once`/cleanup/key destructors, guest signal handlers, guest malloc for TLS, savedata/IME callbacks. Other guest callbacks (fonts, ngs2, AvPlayer, ...) are routed the same way (`Core::ExecuteGuest`) as they turn up |
 | M6 | Emscripten/CMake build | **Done**: `emscripten/CMakeLists.txt` compiles upstream shadPS4's own sources (common, core, ~200 HLE libraries, the GPU command processor) for wasm64 + pthreads; Node and browser targets |
 | M7 | SSE/AVX, string instructions | **Done** (folded into M1) |
-| M8 | Vulkan -> web graphics | **Started**: the VideoOut scan-out path (`video_core/renderer_web`) shows CPU-visible framebuffers on a `<canvas>`, and the command processor's DMA work runs on the CPU. **Not started**: rendering anything the guest draws with the GPU - draws/dispatches are counted and dropped, so GPU-rendered games show a black screen |
+| M8 | Vulkan -> web graphics | **Started**: a WGSL backend for shadPS4's shader recompiler (all 43 of Bully's shaders the recompiler handles pass WebGPU validation); guest compute dispatches run on WebGPU with their results written back to guest memory (`tests/gpu`, in Chromium); frames reach the canvas through WebGPU, WebGL2 or a 2D canvas. **Not started**: draws (graphics pipelines, render targets, textures), so GPU-rendered games still show a black screen |
 | M9 | Frontend ([shadps4_web](https://github.com/Shubin123/shadps4_web)) | **Done for loading and running**: pick an extracted game folder, start, live log, canvas, keyboard -> pad. Playwright test drives it in headless Chromium |
 
 ## Bully (CUSA03507), end to end
@@ -43,7 +43,7 @@ its JIT (a second process), `image/disc01.iso` is the PS2 disc.
   during JitProc revision check`: the handshake with its JIT compiler process. shadPS4 doesn't
   implement PS4 JIT shared memory (`sceKernelJitCreateSharedMemory` & co. are stubs) or running a
   second guest process, natively or here, so Bully can't get further on shadPS4 at all until
-  upstream does. Even then nothing would be visible here until M8 has a GPU backend.
+  upstream does. Even then nothing would be visible here until M8 can draw.
 
 Reproduce:
 ```
@@ -56,9 +56,11 @@ cd ../shadps4_web && node tests/e2e.mjs ../games/ps4/CUSA03507 "IOP Flat Memory"
 
 ```
 UPSTREAM_COMMIT              shadPS4 commit the patch is made against (0614ce32)
-emscripten/CMakeLists.txt    the wasm build (targets: shadps4, shadps4_node, interpreter_tests)
+emscripten/CMakeLists.txt    the wasm build (targets: shadps4, shadps4_node, interpreter_tests,
+                             translate_shaders, gpu_tests)
 emscripten/pre.js            alert() shim for Node/workers (SDL message boxes)
-patches/0001-emscripten.patch   changes to upstream files (33 files, all behind ARCH_WASM)
+emscripten/webgpu.js         the page-side WebGPU device and compute job executor
+patches/0001-emscripten.patch   changes to upstream files (35 files, all behind ARCH_WASM)
 patches/new_files/           new sources, laid out like upstream's src/
   core/interpreter/            the interpreter, HLE thunks, host->guest calls
   core/wasm_layout.h           guest address layout inside linear memory
@@ -66,7 +68,8 @@ patches/new_files/           new sources, laid out like upstream's src/
   core/aerolib/stubs_wasm.cpp  unresolved-import stubs as thunks (natively: Xbyak trampolines)
   core/cpu_patches_wasm.cpp    no-op: nothing to patch when interpreting
   core/guest_call.h            Core::ExecuteGuest - the host->guest call site helper
-  video_core/renderer_web/     Presenter/Rasterizer stand-ins
+  shader_recompiler/backend/wgsl/   IR -> WGSL (the SPIR-V backend's counterpart)
+  video_core/renderer_web/     Presenter/Rasterizer stand-ins, WebGPU bridge, compute pipelines
   web/                         main, window/input, frame hand-off, stubs for excluded libraries
 scripts/setup_tree.sh        build/patched = upstream src/ + patches, as a git repo
 scripts/export_patches.sh    build/patched's diff -> patches/0001-emscripten.patch
@@ -74,6 +77,8 @@ scripts/build_wasm.sh        configure + build
 scripts/run_node.sh          run a game headlessly under Node
 tools/extract_pkg.py         fPKG -> game folder (upstream removed its extractor)
 tests/interpreter/           guest_code.s -> guest_code.inc (gen_guest_code.sh), test_main.cpp
+tests/shaders/               a game's GCN shaders -> WGSL -> WebGPU validation
+tests/gpu/                   hand-assembled GCN compute programs dispatched on WebGPU
 ```
 
 ## Build and test
@@ -88,7 +93,12 @@ git -C ~/shadps4_src submodule update --init --recursive --depth 1
 scripts/setup_tree.sh
 scripts/build_wasm.sh                      # all targets, into build/wasm
 node build/wasm/interpreter_tests.js       # 22/22 + a throughput line
+tests/shaders/run_shader_tests.sh ../games/ps4/CUSA03507/eboot.bin   # WGSL for a game's shaders
+node tests/gpu/run_gpu_tests.mjs           # WebGPU compute, in headless Chromium
 ```
+
+The two browser-side scripts use the Playwright install in the sibling `shadps4_web` checkout
+(`npm install` there) or `PLAYWRIGHT_DIR`.
 
 Developing: edit files in `build/patched/src` (a git repo whose `upstream` tag is pristine), then
 `scripts/export_patches.sh`. New files go straight into `patches/new_files`.
@@ -163,15 +173,65 @@ interface, selected by the two Vulkan headers under `ARCH_WASM`):
 - **Presenter**: reads VideoOut buffers from guest memory, converts A8R8G8B8/A8B8G8R8/A2R10G10B10
   to RGBA8, and hands frames to the page (`web/web_display.cpp`) - or to PPM files under Node
   with `SHADPS4_FRAME_DUMP=dir`. Tiled framebuffers are shown as if linear (there's no CPU
-  detiler, and nothing writes them without a GPU anyway).
+  detiler yet). The page draws them with WebGPU, falling back to WebGL2 and then a 2D canvas
+  (`gpu_presenter.js` in shadps4_web).
 - **Rasterizer**: the GPU command processor (`AmdGpu::Liverpool`, upstream, unmodified) runs
-  and calls it; DMA fills/copies and GDS reads are performed on the CPU, draws and dispatches are
-  counted and dropped.
+  and calls it. DMA fills/copies and GDS reads run on the CPU, compute dispatches run on WebGPU
+  (below), and draws are counted and dropped.
 
-What M8 still needs is a real GPU backend. The most direct route is a WebGPU implementation of
-the rasterizer interface, reusing shadPS4's shader recompiler (GCN -> SPIR-V) and translating its
-SPIR-V to WGSL (Tint or naga compiled to wasm), plus the texture cache's detiling as compute
-shaders. That is the next large piece of work and hasn't been started.
+### Shaders: GCN -> WGSL
+
+Browsers' WebGPU takes WGSL only, so instead of converting the SPIR-V backend's output, a
+second backend emits WGSL from the same recompiler IR (`shader_recompiler/backend/wgsl`):
+frontend, SRT flattening and optimization passes are upstream's, unchanged (the SRT walker that
+upstream generates as x86-64 with Xbyak runs in the interpreter). The backend mirrors the SPIR-V
+resource model: one `@group(0)` binding per `Info` buffer/image/sampler, in that order. Anything
+it can't express yet is returned as an error, not emitted wrong. The cases worth knowing:
+
+- No 64-bit types in WGSL: U64 is `vec2<u32>` with helper arithmetic, F64 is computed as f32.
+- Barriers need uniform control flow, but GCN barriers apply to the whole wave, whatever its
+  exec mask. The ifs around a barrier are closed before it and reopened after it. A loop that
+  contains a barrier keeps every invocation iterating, with finished ones' work predicated off,
+  and exits on a workgroup-wide vote (`workgroupUniformLoad`) once no invocation is still
+  active - the same trip count the wave had on GCN.
+- Integer textures can't be sampled, only loaded; depth textures used with comparisons are
+  declared as `texture_depth_*`.
+
+`tests/shaders` pulls every shader out of a game's eboot (by the `OrbShdr` footers), translates
+them one per process and compiles the WGSL in Chromium's WebGPU. Bully has 48: 43 translate and
+validate, and 5 hit upstream recompiler limits that native shadPS4 shares (unimplemented
+`DS_READ_U8/I8`, a fetch shader that needs draw-time state, an SRT walker reading through a null
+pointer when given zeroed user data).
+
+### Compute on WebGPU
+
+The device lives on the page's main thread, because WebGPU's promises only settle on a thread
+whose event loop runs, and the emulator's threads are pthreads busy in C++.
+`emscripten/webgpu.js` requests a device before the runtime starts. `Web::Gpu`
+(`web_gpu.cpp`) posts a job to the main thread and blocks on a futex word until the job's
+results are back in linear memory.
+
+`Web::ComputePipelines` (`web_compute.cpp`) takes over from `vk_pipeline_cache`/`vk_rasterizer`
+for compute: it builds the RuntimeInfo from the COMPUTE_* registers, translates once per program
+and `StageSpecialization`, and binds each guest buffer (V#), the flattened user data and GDS.
+Each dispatch uploads its buffers from guest memory and copies the written ones back before
+returning, so the guest sees the results as soon as the command processor moves on. That's a
+round trip per dispatch. A GPU-resident buffer cache using the address space's dirty tracking
+is the obvious next step. Shaders that use textures or images aren't dispatched yet.
+
+`tests/gpu` checks the whole path in Chromium with hand-encoded GCN programs set up the way a
+game leaves the registers: an LDS exchange across `s_barrier` over four workgroups (and again
+with rebound buffers, through the cache), and a loop with per-lane trip counts and a barrier in
+its body.
+
+### What's next
+
+Draws: a graphics pipeline cache keyed on the Liverpool state that matters (shaders,
+vertex/index formats, blend/depth/raster state, render-target formats), render targets and
+textures with detiling as compute shaders, and the presenter reading the guest's front buffer
+straight from the GPU instead of from guest memory. WebGL2 can't run WGSL or compute, so on
+browsers without WebGPU it stays a presentation fallback. Rendering there would need a GLSL ES
+backend and has no compute path.
 
 ## What's excluded from the build, and why
 

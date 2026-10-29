@@ -3,7 +3,9 @@
 
 #include <cstring>
 #include "common/logging/log.h"
+#include "core/wasm_high_memory.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_web/web_gpu.h"
 #include "video_core/renderer_web/web_rasterizer.h"
 
 namespace Vulkan {
@@ -27,13 +29,30 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr, u32, u32, u32, VAddr, u16,
 }
 
 void Rasterizer::DispatchDirect() {
-    if (stats.dispatches++ == 0) {
-        LOG_WARNING(Render, "first guest compute dispatch - dropped (no GPU backend yet)");
-    }
+    const auto& cs = liverpool->GetCsRegs();
+    Dispatch(cs, {cs.dim_x, cs.dim_y, cs.dim_z});
 }
 
-void Rasterizer::DispatchIndirect(VAddr, u32, u32) {
-    DispatchDirect();
+void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    // The arguments are three dwords of guest memory: the workgroup counts.
+    std::array<u32, 3> groups{};
+    const VAddr args = address + offset;
+    const u8* host = Core::HighMemory::InRange(args) ? Core::HighMemory::Translate(args)
+                                                     : reinterpret_cast<const u8*>(args);
+    if (host != nullptr && size >= sizeof(groups)) {
+        std::memcpy(groups.data(), host, sizeof(groups));
+    }
+    Dispatch(liverpool->GetCsRegs(), groups);
+}
+
+void Rasterizer::Dispatch(const AmdGpu::ComputeProgram& cs, std::array<u32, 3> groups) {
+    if (compute.Dispatch(cs, groups, gds)) {
+        stats.dispatches_run++;
+    } else if (stats.dispatches - stats.dispatches_run == 0) {
+        LOG_WARNING(Render, "first dropped guest compute dispatch ({})",
+                    Web::Gpu::Available() ? "see the shader's errors above" : "no WebGPU device");
+    }
+    stats.dispatches++;
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {

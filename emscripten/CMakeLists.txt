@@ -111,14 +111,16 @@ target_include_directories(ext_headers SYSTEM INTERFACE
     "${EXT}/vulkan-headers/include"
     "${EXT}/CLI11/include"
     "${EXT}/date/include"
-    "${EXT}/imgui")
+    "${EXT}/imgui"
+    "${EXT}/xbyak")
 
 # --- shadPS4 sources ----------------------------------------------------------------------------
 file(GLOB_RECURSE UPSTREAM_SOURCES CONFIGURE_DEPENDS
     "${PATCHED_SRC}/common/*.cpp"
     "${PATCHED_SRC}/core/*.cpp"
     "${PATCHED_SRC}/input/*.cpp"
-    "${PATCHED_SRC}/video_core/amdgpu/*.cpp")
+    "${PATCHED_SRC}/video_core/amdgpu/*.cpp"
+    "${PATCHED_SRC}/shader_recompiler/*.cpp")
 list(APPEND UPSTREAM_SOURCES "${PATCHED_SRC}/emulator.cpp")
 
 # Excluded: things with no browser equivalent, or whose only implementation is native-only
@@ -127,6 +129,7 @@ list(APPEND UPSTREAM_SOURCES "${PATCHED_SRC}/emulator.cpp")
 # removed from Libraries::InitHLELibs by the patch, so their NIDs fall back to the generic
 # unresolved-import stub, exactly like any other HLE function shadPS4 hasn't written yet.
 set(EXCLUDE_REGEX
+    "/shader_recompiler/backend/spirv/"
     "/core/cpu_patches\\.cpp$"
     "/core/aerolib/stubs\\.cpp$"
     "/core/devtools/"
@@ -176,11 +179,15 @@ configure_file("${SCM_REV_IN}" "${CMAKE_CURRENT_BINARY_DIR}/scm_rev.cpp" @ONLY)
 
 add_library(shadps4_core STATIC ${UPSTREAM_SOURCES} ${NEW_SOURCES}
             "${CMAKE_CURRENT_BINARY_DIR}/scm_rev.cpp")
-target_include_directories(shadps4_core PUBLIC "${NEW_FILES}" "${PATCHED_SRC}")
+target_include_directories(shadps4_core PUBLIC "${NEW_FILES}" "${PATCHED_SRC}" "${PATCHED_SRC}/..")
 target_compile_definitions(shadps4_core PUBLIC
     BOOST_ASIO_STANDALONE
     IMGUI_USER_CONFIG="imgui/imgui_config.h"
     ARCH_WASM=1)
+# Xbyak picks 32- or 64-bit code generation from the host target; the only Xbyak user built here
+# (the shader SRT walker) emits x86-64 that the interpreter runs.
+set_source_files_properties("${PATCHED_SRC}/shader_recompiler/ir/passes/flatten_extended_userdata_pass.cpp"
+    PROPERTIES COMPILE_DEFINITIONS "XBYAK64=1;XBYAK64_GCC=1")
 target_compile_options(shadps4_core PRIVATE -sUSE_SDL=3 -sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_FREETYPE=1)
 target_link_libraries(shadps4_core PUBLIC
     ext_headers fmt::fmt Zydis toml11::toml11 magic_enum::magic_enum tsl::robin_map
@@ -215,9 +222,12 @@ target_link_options(shadps4_node PRIVATE ${SHADPS4_LINK_FLAGS} -sNODERAWFS=1 -sE
 # Browser build: the page mounts the game folder and drives main (see shadps4_web).
 add_executable(shadps4 "${NEW_FILES}/web/main_web.cpp")
 target_link_libraries(shadps4 PRIVATE shadps4_core)
+# webgpu.js gives the page's WebGPU device to the renderer (video_core/renderer_web/web_gpu.h).
+set(WEBGPU_LINK_FLAGS "--pre-js=${CMAKE_CURRENT_LIST_DIR}/webgpu.js"
+    "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$addRunDependency,$removeRunDependency")
 target_link_options(shadps4 PRIVATE ${SHADPS4_LINK_FLAGS} -sINVOKE_RUN=0 -sMODULARIZE=1
                     -sEXPORT_NAME=createShadPS4 -sENVIRONMENT=web,worker
-                    "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js")
+                    "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js" ${WEBGPU_LINK_FLAGS})
 
 # Interpreter tests (tests/interpreter): `node build/wasm/interpreter_tests.js`.
 add_executable(interpreter_tests "${REPO_ROOT}/tests/interpreter/test_main.cpp")
@@ -225,3 +235,25 @@ target_link_libraries(interpreter_tests PRIVATE shadps4_core)
 target_include_directories(interpreter_tests PRIVATE "${REPO_ROOT}/tests/interpreter")
 target_link_options(interpreter_tests PRIVATE ${SHADPS4_LINK_FLAGS} -sNODERAWFS=1 -sEXIT_RUNTIME=1
                     -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js")
+
+# Shader translation check (tests/shaders): GCN shaders from a game -> recompiler -> WGSL.
+add_executable(translate_shaders "${REPO_ROOT}/tests/shaders/translate_main.cpp")
+target_link_libraries(translate_shaders PRIVATE shadps4_core)
+target_link_options(translate_shaders PRIVATE ${SHADPS4_LINK_FLAGS} -sNODERAWFS=1 -sEXIT_RUNTIME=1
+                    -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js")
+
+# WebGPU compute path (tests/gpu): GCN programs dispatched through Web::ComputePipelines in a
+# browser; `node tests/gpu/run_gpu_tests.mjs` serves the page and drives headless Chromium.
+add_executable(gpu_tests "${REPO_ROOT}/tests/gpu/compute_test.cpp")
+target_link_libraries(gpu_tests PRIVATE shadps4_core)
+target_link_options(gpu_tests PRIVATE ${SHADPS4_LINK_FLAGS} -sEXIT_RUNTIME=1
+                    -sENVIRONMENT=web,worker "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js"
+                    ${WEBGPU_LINK_FLAGS})
+
+# --pre-js files aren't link inputs as far as CMake knows; relink when they change.
+foreach(target shadps4_node shadps4 interpreter_tests translate_shaders gpu_tests)
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/pre.js")
+endforeach()
+foreach(target shadps4 gpu_tests)
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/webgpu.js")
+endforeach()
