@@ -24,7 +24,7 @@ browser exposes Vulkan.
 | M5 | Wiring into shadPS4 | **Done for everything a game hits on boot**: `RunMainEntry`, module start, threads (`_runOnAnotherStack`), TLS (`fs:`), `pthread_once`/cleanup/key destructors, guest signal handlers, guest malloc for TLS, savedata/IME callbacks. Other guest callbacks (fonts, ngs2, AvPlayer, ...) are routed the same way (`Core::ExecuteGuest`) as they turn up |
 | M6 | Emscripten/CMake build | **Done**: `emscripten/CMakeLists.txt` compiles upstream shadPS4's own sources (common, core, ~200 HLE libraries, the GPU command processor) for wasm64 + pthreads; Node and browser targets |
 | M7 | SSE/AVX, string instructions | **Done** (folded into M1) |
-| M8 | Vulkan -> web graphics | **Draws and compute run on WebGPU**: GCN shaders recompiled to WGSL; graphics pipelines from the Liverpool state, render targets, depth/stencil, blending, textures (detiled and converted on the CPU), samplers, fast clears, every primitive type (the ones WebGPU lacks emulated), indirect draws; compute with buffers, textures and written images; display buffers read back from the GPU at flip. Checked pixel by pixel in `tests/gpu` (Chromium and Node/Dawn), and Bloodborne renders through it (see below). **Not yet**: geometry/tessellation stages (WebGPU has neither), MSAA, writing GPU results back to guest memory for the CPU |
+| M8 | Vulkan -> web graphics | **Draws and compute run on WebGPU**: GCN shaders recompiled to WGSL; graphics pipelines from the Liverpool state, render targets, depth/stencil, blending, textures (detiled and converted on the CPU), samplers, fast clears, every primitive type (the ones WebGPU lacks emulated), indirect draws; compute with buffers, textures and written images; display buffers read back from the GPU at flip. Checked pixel by pixel in `tests/gpu` (Chromium and Node/Dawn), and Bloodborne renders its boot logo through it (see below). **Not yet**: geometry/tessellation stages (WebGPU has neither), MSAA, writing GPU results back to guest memory for the CPU |
 | M9 | Frontend ([shadps4_web](https://github.com/Shubin123/shadps4_web)) | **Done for loading and running**: pick an extracted game folder, start, live log, canvas, keyboard -> pad. Playwright test drives it in headless Chromium |
 
 ## Bully (CUSA03507), end to end
@@ -61,14 +61,13 @@ runs in the Node build on Dawn's WebGPU (`scripts/run_node.sh`), reading the gam
 - It boots: modules load, `main` runs, threads start, its network setup gets "no network"
   answers from the offline libSceNet instead of a NULL errno pointer (which crashed it before),
   and it streams its data (`dvdroot_ps4/...`) through the file system.
-- Its GPU work runs on WebGPU: compute passes writing lookup tables and images, a depth-only pass
-  and a colour-grading pass over the display buffers. In the first 32 submits, 92 of 92 draws and
-  275 of 275 dispatches ran, and every flip was read back from the GPU.
-- What's on screen in the first minutes is uniform mid-gray. That is what the guest's buffers
-  hold: the grading pass reads a 1920x1080 buffer the game filled with `0xFF808080` before any GPU
-  work (traced with `SHADPS4_WEBGPU_TRACE=1`) and maps it through its lookup tables. At the
-  interpreter's speed - seconds per frame - the game was still loading its menus after several
-  minutes, before drawing its logos.
+- Its GPU work runs on WebGPU: compute passes writing lookup tables and images, depth passes,
+  textured draws and a colour-grading pass over the display buffers. In the first 512 submits,
+  2554 of 2554 draws and 3659 of 3659 dispatches ran, and every flip was read back from the GPU.
+- What it shows: first mid-gray (the grading pass maps a 1920x1080 buffer the game fills with
+  `0xFF808080` before any GPU work, traced with `SHADPS4_WEBGPU_TRACE=1`), then black, then its
+  boot logo - "JAPAN Studio", a BC7 texture drawn over black and graded - rendered correctly,
+  about 5.5 minutes and 500 frames after the first one (Apple M4, Dawn on Metal).
 
 ```
 tools/extract_pkg.py CUSA03173.pkg ../games/ps4/CUSA03173

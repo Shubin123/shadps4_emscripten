@@ -12,8 +12,8 @@ loader, linker, memory manager and HLE libraries around it, compiled for wasm64.
 with the PS4 GPU is rendered on WebGPU: shadPS4's shader recompiler emits WGSL, and draws
 (graphics pipelines, render targets, depth/stencil, blending, textures) and compute dispatches
 run on the GPU, with display buffers read back at each flip. Bloodborne (CUSA03173) boots and
-renders through it (every draw and dispatch it issues runs), though slowly: the interpreter does
-~60 MIPS. Missing: geometry/tessellation stages, MSAA, and handing GPU results back to the CPU.
+renders through it - every draw and dispatch it issues runs, and its boot logo comes out right -
+though slowly: the interpreter does ~60 MIPS. Missing: geometry/tessellation stages, MSAA, and handing GPU results back to the CPU.
 Bully (a PS2 Classic, CUSA03507) gets as far as native shadPS4 does: its PS2 emulator
 initializes, then stops where it needs a JIT compiler process that shadPS4 doesn't support on
 any platform.
