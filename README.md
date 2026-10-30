@@ -8,12 +8,15 @@ can't do, so this port adds an x86-64 interpreter and the plumbing to run upstre
 loader, linker, memory manager and HLE libraries around it, compiled for wasm64. Read
 [PROJECT.md](PROJECT.md) for the design, status and limits.
 
-**Where it is:** games load and their code runs (in Node and in Chrome), and the WebGPU backend
-has started: shadPS4's shader recompiler emits WGSL, and guest compute dispatches run on WebGPU.
-Nothing the PS4 GPU draws is rendered yet, because draws aren't implemented, and the interpreter
-is slow (~60 MIPS). The test game, Bully (a PS2 Classic, CUSA03507), gets as far as
-native shadPS4 does: its PS2 emulator initializes, then stops where it needs a JIT compiler
-process that shadPS4 doesn't support on any platform.
+**Where it is:** games load and their code runs (in Node and in Chrome), and what they draw
+with the PS4 GPU is rendered on WebGPU: shadPS4's shader recompiler emits WGSL, and draws
+(graphics pipelines, render targets, depth/stencil, blending, textures) and compute dispatches
+run on the GPU, with display buffers read back at each flip. Bloodborne (CUSA03173) boots and
+renders through it (every draw and dispatch it issues runs), though slowly: the interpreter does
+~60 MIPS. Missing: geometry/tessellation stages, MSAA, and handing GPU results back to the CPU.
+Bully (a PS2 Classic, CUSA03507) gets as far as native shadPS4 does: its PS2 emulator
+initializes, then stops where it needs a JIT compiler process that shadPS4 doesn't support on
+any platform.
 
 **Paleblood:** the build includes the verified C++ rewrites of Bloodborne functions from
 [Paleblood](https://github.com/Yharnam-Hunters/Paleblood), the Bloodborne decompilation
@@ -30,10 +33,11 @@ git -C ../upstream_native/shadps4 submodule update --init --recursive --depth 1
 scripts/setup_tree.sh                    # build/patched = upstream src + patches/
 scripts/build_wasm.sh                    # build/wasm/{shadps4,shadps4_node,interpreter_tests,...}.js
 node build/wasm/interpreter_tests.js     # interpreter tests
-node tests/gpu/run_gpu_tests.mjs         # WebGPU compute tests (headless Chromium via Playwright)
+node tests/gpu/run_gpu_tests.mjs         # WebGPU dispatch and draw tests (headless Chromium)
 
 tools/extract_pkg.py GAME.pkg ../games/ps4/GAME   # fake-signed PKGs; needs `cryptography`
 scripts/run_node.sh ../games/ps4/GAME/eboot.bin   # headless run, log in build/run/out.txt
+                                                  # (renders on Dawn if `webgpu` is installed)
 ```
 
 For the browser, copy `build/wasm/shadps4.{js,wasm}` into shadps4_web (`scripts/sync_runtime.sh`

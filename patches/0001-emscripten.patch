@@ -1364,6 +1364,24 @@ index 072a1cf..5ffb1a2 100644
  }
  
  void Emulator::UpdatePlayTime(const std::string_view serial) {
+diff --git a/src/shader_recompiler/frontend/translate/translate.cpp b/src/shader_recompiler/frontend/translate/translate.cpp
+index 3c4f543..ba0a105 100644
+--- a/src/shader_recompiler/frontend/translate/translate.cpp
++++ b/src/shader_recompiler/frontend/translate/translate.cpp
+@@ -1153,7 +1153,13 @@ template void Translator::SetDstPk<IR::F32, false>(const InstOperand& operand,
+ void Translator::EmitFetch(const GcnInst& inst) {
+     const auto code_sgpr_base = inst.src[0].code;
+ 
++#ifdef ARCH_WASM
++    // WebGPU's vertex input formats and strides are narrower than the guest's, and rectangle
++    // lists need vertices fetched by computed index: the WGSL backend always fetches inline.
++    if (true) {
++#else
+     if (EmulatorSettings.IsInlineFetchShader()) {
++#endif
+         // Translate fetch shader inline using regular buffer bindings; useful for debugging.
+         const auto* code = GetFetchShaderCode(info, code_sgpr_base);
+         GcnCodeSlice slice(code, code + std::numeric_limits<u32>::max());
 diff --git a/src/shader_recompiler/info.h b/src/shader_recompiler/info.h
 index 75dcac5..47fe72d 100644
 --- a/src/shader_recompiler/info.h

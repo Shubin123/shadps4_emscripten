@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Stands in for Vulkan::Presenter (video_core/renderer_vulkan/vk_presenter.h) in the wasm build,
-// keeping the name and the subset of the interface VideoOut/GnmDriver use. It presents VideoOut
-// buffers by reading them straight out of guest memory on the CPU and handing RGBA8 to the page
-// (web/web_display.h) - the scan-out half of the display path. What it can't show yet is anything
-// the guest drew with the GPU, since there is no GPU backend behind Rasterizer (PROJECT.md, M8).
+// keeping the name and the subset of the interface VideoOut/GnmDriver use. At each flip it hands
+// the page (web/web_display.h) the VideoOut buffer as RGBA8: read back from the GPU when the
+// guest rendered it there (Rasterizer::ReadScanout), otherwise read from guest memory on the CPU,
+// detiled if the buffer is tiled.
 
 #pragma once
 
@@ -97,6 +97,7 @@ private:
     u32 next_frame{};
     Frame* last_frame{};
     bool warned_tiled{};
+    u64 gpu_frames{};
 };
 
 } // namespace Vulkan

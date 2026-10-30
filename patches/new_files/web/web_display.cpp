@@ -28,9 +28,11 @@ Slot slots[2];
 std::mutex slot_mutex;
 std::atomic<u32> pending{0};
 std::atomic<u64> submitted{0};
+std::atomic<u64> game_frames{0};
 u32 write_slot = 0;
 
-void DumpPpm(const Slot& slot, u64 index) {
+// Game frames only (not the presenter's blank ones between flips), numbered from 1.
+void DumpPpm(const u32* pixels, u32 width, u32 height, u64 index) {
     static const char* dir = std::getenv("SHADPS4_FRAME_DUMP");
     if (dir == nullptr) {
         return;
@@ -45,11 +47,11 @@ void DumpPpm(const Slot& slot, u64 index) {
     if (!f) {
         return;
     }
-    std::fprintf(f, "P6\n%u %u\n255\n", slot.width, slot.height);
-    std::vector<u8> row(slot.width * 3);
-    for (u32 y = 0; y < slot.height; y++) {
-        for (u32 x = 0; x < slot.width; x++) {
-            const u32 p = slot.pixels[y * slot.width + x];
+    std::fprintf(f, "P6\n%u %u\n255\n", width, height);
+    std::vector<u8> row(width * 3);
+    for (u32 y = 0; y < height; y++) {
+        for (u32 x = 0; x < width; x++) {
+            const u32 p = pixels[y * width + x];
             row[x * 3 + 0] = p & 0xFF;
             row[x * 3 + 1] = (p >> 8) & 0xFF;
             row[x * 3 + 2] = (p >> 16) & 0xFF;
@@ -70,8 +72,12 @@ EMSCRIPTEN_KEEPALIVE void shadps4_display_release() {
 
 } // extern "C"
 
-void Submit(const u32* rgba, u32 width, u32 height, bool) {
+void Submit(const u32* rgba, u32 width, u32 height, bool is_game_frame) {
     const u64 index = ++submitted;
+    if (is_game_frame) {
+        // Before the page's pacing can drop it.
+        DumpPpm(rgba, width, height, ++game_frames);
+    }
     if (pending.load(std::memory_order_acquire) != 0) {
         // The page hasn't drawn the previous frame yet; drop this one rather than stall the
         // emulator on the browser's frame pacing.
@@ -86,7 +92,6 @@ void Submit(const u32* rgba, u32 width, u32 height, bool) {
         slot->pixels.assign(rgba, rgba + static_cast<size_t>(width) * height);
         write_slot ^= 1;
     }
-    DumpPpm(*slot, index);
     pending.store(1, std::memory_order_release);
     // Copied out of linear memory here, in Emscripten's own JS scope, where its heap views are
     // kept valid across memory growth; the page gets a plain RGBA array it can keep.

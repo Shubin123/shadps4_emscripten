@@ -5,7 +5,9 @@
 #include <cstring>
 #include "common/logging/log.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "common/number_utils.h"
 #include "video_core/renderer_web/web_presenter.h"
+#include "video_core/renderer_web/web_tiling.h"
 #include "web/web_display.h"
 
 namespace Vulkan {
@@ -57,6 +59,17 @@ static u32 ToRgba8(PixelFormat format, const u8* src) {
     }
 }
 
+// A16R16G16B16Float: half floats, B G R A in memory order like the 8-bit formats.
+static u32 HalfToRgba8(const u8* src) {
+    u16 h[4];
+    std::memcpy(h, src, sizeof(h));
+    const auto to8 = [](u16 v) {
+        const float f = std::clamp(NumberUtils::Uf16ToF32(v), 0.0f, 1.0f);
+        return static_cast<u32>(f * 255.0f + 0.5f);
+    };
+    return to8(h[2]) | (to8(h[1]) << 8) | (to8(h[0]) << 16) | 0xFF000000u;
+}
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& group,
                                VAddr cpu_address) {
     const auto& attrib = group.attrib;
@@ -64,28 +77,53 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->width = attrib.width;
     frame->height = attrib.height;
     frame->rgba.resize(static_cast<size_t>(attrib.width) * attrib.height);
+    const bool half = attrib.pixel_format == PixelFormat::A16R16G16B16Float;
+    const u32 bpp = half ? 8 : 4;
+    const auto convert = [&](const u8* src, size_t pitch_pixels) {
+        for (u32 y = 0; y < attrib.height; y++) {
+            const u8* row = src + y * pitch_pixels * bpp;
+            u32* out = frame->rgba.data() + static_cast<size_t>(y) * attrib.width;
+            for (u32 x = 0; x < attrib.width; x++) {
+                out[x] = half ? HalfToRgba8(row + x * bpp) : ToRgba8(attrib.pixel_format,
+                                                                      row + x * bpp);
+            }
+        }
+    };
 
-    if (attrib.pixel_format == PixelFormat::A16R16G16B16Float) {
-        std::fill(frame->rgba.begin(), frame->rgba.end(), 0xFF000000u);
+    // What the GPU rendered there, unless the CPU has written the buffer since.
+    std::vector<u8> pixels;
+    if (rasterizer->ReadScanout(cpu_address, attrib.width, attrib.height, bpp, pixels)) {
+        convert(pixels.data(), attrib.width);
+        rasterizer->OnFlip();
+        if (const u64 n = ++gpu_frames; (n & (n - 1)) == 0) {
+            LOG_INFO(Render, "{} frame(s) presented from the GPU (buffer {:#x})", n, cpu_address);
+        }
         return frame;
     }
-    if (attrib.tiling_mode == TilingMode::Tile && !warned_tiled) {
-        // Display buffers the GPU renders into are GCN-tiled; detiling them on the CPU only
-        // matters once there's a GPU backend producing their contents, so for now they're read
-        // as if linear (which shows the right thing for CPU-written linear buffers and garbage -
-        // rather than nothing - for tiled ones).
-        LOG_WARNING(Render, "tiled VideoOut buffer presented as linear (no CPU detiler yet)");
-        warned_tiled = true;
-    }
+    rasterizer->OnFlip();
+
     const u8* src = reinterpret_cast<const u8*>(cpu_address);
-    const size_t pitch_bytes = static_cast<size_t>(attrib.pitch_in_pixel) * 4;
-    for (u32 y = 0; y < attrib.height; y++) {
-        const u8* row = src + y * pitch_bytes;
-        u32* out = frame->rgba.data() + static_cast<size_t>(y) * attrib.width;
-        for (u32 x = 0; x < attrib.width; x++) {
-            out[x] = ToRgba8(attrib.pixel_format, row + x * 4);
+    if (attrib.tiling_mode == TilingMode::Tile) {
+        // Display buffers are tiled as the GPU's color buffers are (ImageInfo's VideoOut case).
+        Web::SurfaceLayout layout;
+        layout.tile_mode = AmdGpu::TileMode::Display2DThin;
+        layout.array_mode = AmdGpu::GetArrayMode(layout.tile_mode);
+        layout.num_bits = bpp * 8;
+        layout.pitch = (attrib.width + 127) & ~127u;
+        layout.height = attrib.height;
+        if (layout.Compute()) {
+            std::vector<u8> linear(layout.guest_size);
+            Web::Detile(layout, src, linear.data());
+            convert(linear.data(), layout.MipPitchElements(0));
+            return frame;
+        }
+        if (!warned_tiled) {
+            LOG_WARNING(Render, "tiled VideoOut buffer {}x{} presented as linear",
+                        attrib.width, attrib.height);
+            warned_tiled = true;
         }
     }
+    convert(src, attrib.pitch_in_pixel);
     return frame;
 }
 

@@ -19,51 +19,13 @@
 #include "video_core/amdgpu/regs_shader.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_web/web_compute.h"
+#include "video_core/renderer_web/web_context.h"
 #include "video_core/renderer_web/web_gpu.h"
+#include "gcn_test.h"
 
 namespace {
 
-constexpr u32 SMovVccHi = 0xBEEB03FF; // s_mov_b32 vcc_hi, literal: shaders start with it
-constexpr u32 SEndpgm = 0xBF810000;
-constexpr u32 SBarrier = 0xBF8A0000;
-constexpr u32 SWaitVm = 0xBF8C0F70;   // s_waitcnt vmcnt(0)
-constexpr u32 SWaitLgkm = 0xBF8C007F; // s_waitcnt lgkmcnt(0)
-
-// Copies `body` into 256-byte aligned memory (the register holds address >> 8) behind the
-// s_mov_b32 vcc_hi header, followed by the OrbShdr footer the header points at.
-const u32* Assemble(const std::vector<u32>& body, u64 hash) {
-    const size_t length = 2 + body.size();
-    const size_t footer = (length + 1) & ~size_t{1};
-    auto* code = static_cast<u32*>(std::aligned_alloc(256, 1024 + footer * 4));
-    std::memset(code, 0, 1024 + footer * 4);
-    code[0] = SMovVccHi;
-    code[1] = static_cast<u32>(footer / 2 - 1);
-    std::memcpy(code + 2, body.data(), body.size() * 4);
-    AmdGpu::BinaryInfo info{};
-    std::memcpy(info.signature.data(), AmdGpu::BinaryInfo::signature_ref.data(),
-                info.signature.size());
-    info.length = static_cast<u32>(length * 4);
-    info.shader_hash = hash;
-    std::memcpy(code + footer, &info, sizeof(info));
-    return code;
-}
-
-// A raw (untyped) buffer V# over `words` dwords at `data`.
-std::array<u32, 4> BufferSharp(const u32* data, u32 words) {
-    AmdGpu::Buffer sharp{};
-    sharp.base_address = reinterpret_cast<u64>(data);
-    sharp.stride = 4;
-    sharp.num_records = words;
-    sharp.dst_sel_x = 4;
-    sharp.dst_sel_y = 5;
-    sharp.dst_sel_z = 6;
-    sharp.dst_sel_w = 7;
-    sharp.num_format = 7;  // float
-    sharp.data_format = 4; // 32
-    std::array<u32, 4> dwords;
-    std::memcpy(dwords.data(), &sharp, sizeof(dwords));
-    return dwords;
-}
+using namespace GcnTest;
 
 AmdGpu::ComputeProgram Program(const u32* code, u32 user_regs, u32 threads, u32 lds_bytes) {
     AmdGpu::ComputeProgram cs{};
@@ -76,13 +38,6 @@ AmdGpu::ComputeProgram Program(const u32* code, u32 user_regs, u32 threads, u32 
     cs.num_thread_y.full = 1;
     cs.num_thread_z.full = 1;
     return cs;
-}
-
-int failures = 0;
-
-void Check(const char* name, bool ok) {
-    std::printf("%s %s\n", ok ? "PASS" : "FAIL", name);
-    failures += ok ? 0 : 1;
 }
 
 // out[gid] = in[gid] + in[gid ^ 1] + 1, the neighbour's value passed through LDS across an
@@ -119,7 +74,8 @@ void TestLdsExchange(std::span<u32> gds) {
     std::memcpy(&cs.user_data[0], in_sharp.data(), 16);
     std::memcpy(&cs.user_data[4], out_sharp.data(), 16);
 
-    Web::ComputePipelines pipelines;
+    Web::Context ctx;
+    Web::ComputePipelines pipelines{ctx};
     const bool ran = pipelines.Dispatch(cs, {N / 64, 1, 1}, gds);
     Check("lds-exchange: dispatch ran", ran);
     u32 wrong = 0;
@@ -170,7 +126,8 @@ void TestDivergentLoopWithBarrier(std::span<u32> gds) {
     auto cs = Program(code, 4, N, 0);
     const auto sharp = BufferSharp(out.data(), N);
     std::memcpy(&cs.user_data[0], sharp.data(), 16);
-    Web::ComputePipelines pipelines;
+    Web::Context ctx;
+    Web::ComputePipelines pipelines{ctx};
     const bool ran = pipelines.Dispatch(cs, {1, 1, 1}, gds);
     Check("divergent-loop-barrier: dispatch ran", ran);
     u32 wrong = 0;
@@ -183,6 +140,9 @@ void TestDivergentLoopWithBarrier(std::span<u32> gds) {
 }
 
 } // namespace
+
+// draw_test.cpp
+void RunDrawTests();
 
 int main() {
     Common::Log::Setup("gpu_tests.log"); // the page's console gets the emulator's log too
@@ -197,6 +157,7 @@ int main() {
     static std::array<u32, 0x10000 / 4> gds{};
     TestLdsExchange(gds);
     TestDivergentLoopWithBarrier(gds);
-    std::printf("GPU TESTS: %s\n", failures == 0 ? "PASS" : "FAIL");
-    return failures == 0 ? 0 : 1;
+    RunDrawTests();
+    std::printf("GPU TESTS: %s\n", GcnTest::failures == 0 ? "PASS" : "FAIL");
+    return GcnTest::failures == 0 ? 0 : 1;
 }

@@ -10,7 +10,6 @@
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
 #include "shader_recompiler/backend/wgsl/emit_wgsl.h"
-#include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/attribute.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -84,7 +83,8 @@ struct Phi {
 class Emitter {
 public:
     Emitter(const Profile& profile_, const RuntimeInfo& rt_, const IR::Program& program_)
-        : profile{profile_}, rt{rt_}, program{program_}, info{program_.info} {}
+        : profile{profile_}, rt{rt_}, program{program_}, info{program_.info},
+          group{program_.info.sw_stage == SwStage::Fragment ? 1u : 0u} {}
 
     Output Run();
 
@@ -210,7 +210,11 @@ private:
         bool is_3d{};
         bool is_cube{};
         bool is_msaa{};
+        bool is_1d{};      // declared as 2D; the guest's coordinates have one spatial component
         int coord_dims{2}; // spatial dimensions
+        // The T#'s component selection, applied to sampled results (WebGPU texture views have
+        // no swizzle); empty for identity.
+        std::string swizzle;
     };
     std::vector<ImageDesc> images;
     std::string ImageName(u32 handle) {
@@ -220,12 +224,39 @@ private:
         return fmt::format("samp{}", handle >> 16);
     }
     std::string SampleCoords(const ImageDesc& img, const std::string& coords, IR::Type type);
-    std::string ArrayLayer(const ImageDesc& img, const std::string& coords);
+    std::string ArrayLayer(const ImageDesc& img, const std::string& coords, IR::Type type);
     std::string ResultF32x4(const ImageDesc& img, const std::string& expr) {
         if (img.is_integer) {
             return fmt::format("bitcast<vec4<f32>>({})", expr);
         }
         return expr;
+    }
+    // `v` with the image's component selection applied, as a vec4<f32> expression.
+    static std::string SwizzleOf(const AmdGpu::CompMapping& map, bool is_integer) {
+        const auto comp = [&](AmdGpu::CompSwizzle c) -> std::string {
+            switch (c) {
+            case AmdGpu::CompSwizzle::Zero:
+                return "0.0f";
+            case AmdGpu::CompSwizzle::One:
+                return is_integer ? "bitcast<f32>(1u)" : "1.0f";
+            case AmdGpu::CompSwizzle::Red:
+                return "{0}.x";
+            case AmdGpu::CompSwizzle::Green:
+                return "{0}.y";
+            case AmdGpu::CompSwizzle::Blue:
+                return "{0}.z";
+            default:
+                return "{0}.w";
+            }
+        };
+        const std::string s = fmt::format("vec4<f32>({}, {}, {}, {})", comp(map.r), comp(map.g),
+                                          comp(map.b), comp(map.a));
+        return s == "vec4<f32>({0}.x, {0}.y, {0}.z, {0}.w)" ? std::string{} : s;
+    }
+    void ApplySwizzle(const ImageDesc& img, const std::string& dst) {
+        if (!img.swizzle.empty()) {
+            L("{} = {};", dst, fmt::format(fmt::runtime(img.swizzle), dst));
+        }
     }
     void EmitImageOp(const IR::Inst& inst);
     void EmitAtomic(const IR::Inst& inst, bool shared, const char* fn, bool signed_op);
@@ -234,6 +265,7 @@ private:
     const RuntimeInfo& rt;
     const IR::Program& program;
     const Info& info;
+    const u32 group;
     Output out;
 
     std::string body;
@@ -255,6 +287,7 @@ private:
     u32 next_loop_id = 0;
     std::set<u32> comparison_samplers;
     std::set<u32> depth_compared_images;
+    std::set<u32> storage_read_images; // written images the program also reads
     std::set<std::string> helpers_used;
     u32 flatbuf_index = ~0u;
     bool uses_shared = false;
@@ -321,6 +354,12 @@ void Emitter::Prepass() {
                     buffer_atomic[handle] = true;
                 }
             }
+            if (op == IR::Opcode::ImageRead) {
+                const u32 image = inst.Arg(0).U32() & 0xFFFF;
+                if (image < info.images.size() && info.images[image].is_written) {
+                    storage_read_images.insert(image);
+                }
+            }
             switch (op) {
             case IR::Opcode::ImageSampleDrefImplicitLod:
             case IR::Opcode::ImageSampleDrefExplicitLod:
@@ -381,8 +420,8 @@ void Emitter::EmitDeclarations() {
         }
         const std::string elem = BufAtomic(i) ? "atomic<u32>" : "u32";
         const std::string type = fmt::format("array<{}>", elem);
-        decls += fmt::format("@group(0) @binding({}) var<storage, {}> buf{}: {};\n", binding,
-                             writable ? "read_write" : "read", i, type);
+        decls += fmt::format("@group({}) @binding({}) var<storage, {}> buf{}: {};\n", group,
+                             binding, writable ? "read_write" : "read", i, type);
         out.bindings.push_back({Binding::Kind::Buffer, binding++, i, writable, false, type});
     }
     for (u32 i = 0; i < info.images.size(); i++) {
@@ -400,11 +439,13 @@ void Emitter::EmitDeclarations() {
         case AmdGpu::ImageType::Color1D:
         case AmdGpu::ImageType::Color2D:
             dim = "2d";
+            img.is_1d = view == AmdGpu::ImageType::Color1D;
             break;
         case AmdGpu::ImageType::Color1DArray:
         case AmdGpu::ImageType::Color2DArray:
             dim = "2d_array";
             img.is_array = true;
+            img.is_1d = view == AmdGpu::ImageType::Color1DArray;
             break;
         case AmdGpu::ImageType::Color3D:
             dim = "3d";
@@ -433,39 +474,26 @@ void Emitter::EmitDeclarations() {
                 Error("image atomics");
             }
             const auto dfmt = sharp.GetDataFmt();
-            std::string texel;
-            using DF = AmdGpu::DataFormat;
-            using NF = AmdGpu::NumberFormat;
-            if (dfmt == DF::Format8_8_8_8 && nfmt == NF::Unorm) {
-                texel = "rgba8unorm";
-            } else if (dfmt == DF::Format8_8_8_8 && nfmt == NF::Uint) {
-                texel = "rgba8uint";
-            } else if (dfmt == DF::Format32 && nfmt == NF::Float) {
-                texel = "r32float";
-            } else if (dfmt == DF::Format32 && nfmt == NF::Uint) {
-                texel = "r32uint";
-            } else if (dfmt == DF::Format32 && nfmt == NF::Sint) {
-                texel = "r32sint";
-            } else if (dfmt == DF::Format32_32 && nfmt == NF::Float) {
-                texel = "rg32float";
-            } else if (dfmt == DF::Format32_32 && nfmt == NF::Uint) {
-                texel = "rg32uint";
-            } else if (dfmt == DF::Format16_16_16_16 && nfmt == NF::Float) {
-                texel = "rgba16float";
-            } else if (dfmt == DF::Format32_32_32_32 && nfmt == NF::Float) {
-                texel = "rgba32float";
-            } else if (dfmt == DF::Format32_32_32_32 && nfmt == NF::Uint) {
-                texel = "rgba32uint";
-            } else {
+            std::string texel = StorageTexelFormat(dfmt, nfmt);
+            if (texel.empty()) {
                 texel = "rgba8unorm";
                 Error(fmt::format("storage image format {}/{}", magic_enum::enum_name(dfmt),
                                   magic_enum::enum_name(nfmt)));
             }
-            if (img.is_cube || img.is_msaa) {
-                Error("storage image of cube/msaa type");
+            if (img.is_cube) {
+                // WGSL storage textures can't be cubes; GCN addresses a cube's faces as layers
+                // (x, y, face) anyway.
+                img.is_cube = false;
+                img.is_array = true;
+                img.coord_dims = 2;
+                dim = "2d_array";
+            } else if (img.is_msaa) {
+                Error("storage image of msaa type");
                 dim = "2d";
             }
-            type = fmt::format("texture_storage_{}<{}, write>", dim, texel);
+            // Read back as well as written: read_write (the formats tier2 allows).
+            const char* access = storage_read_images.contains(i) ? "read_write" : "write";
+            type = fmt::format("texture_storage_{}<{}, {}>", dim, texel, access);
             out.bindings.push_back(
                 {Binding::Kind::StorageTexture, binding, i, true, false, type});
         } else if (depth_compared_images.contains(i)) {
@@ -480,13 +508,16 @@ void Emitter::EmitDeclarations() {
             out.bindings.push_back({Binding::Kind::Texture, binding, i, false, false, type});
         }
         img.type = type;
-        decls += fmt::format("@group(0) @binding({}) var tex{}: {};\n", binding++, i, type);
+        if (!img.is_storage && !img.is_depth) {
+            img.swizzle = SwizzleOf(sharp.DstSelect(), img.is_integer);
+        }
+        decls += fmt::format("@group({}) @binding({}) var tex{}: {};\n", group, binding++, i, type);
         images.push_back(img);
     }
     for (u32 i = 0; i < info.samplers.size(); i++) {
         const bool cmp = comparison_samplers.contains(i);
         const std::string type = cmp ? "sampler_comparison" : "sampler";
-        decls += fmt::format("@group(0) @binding({}) var samp{}: {};\n", binding, i, type);
+        decls += fmt::format("@group({}) @binding({}) var samp{}: {};\n", group, binding, i, type);
         out.bindings.push_back({Binding::Kind::Sampler, binding++, i, false, cmp, type});
     }
     if (info.sw_stage == SwStage::Compute) {
@@ -726,13 +757,28 @@ void Emitter::EmitBarrier(const char* call) {
 
 // ---- instructions ----------------------------------------------------------------------------
 
+static int NumComponents(IR::Type type) {
+    switch (type) {
+    case IR::Type::F32:
+    case IR::Type::U32:
+        return 1;
+    case IR::Type::F32x2:
+    case IR::Type::U32x2:
+        return 2;
+    case IR::Type::F32x3:
+    case IR::Type::U32x3:
+        return 3;
+    default:
+        return 4;
+    }
+}
+
 std::string Emitter::SampleCoords(const ImageDesc& img, const std::string& c, IR::Type type) {
-    // Coordinates arrive as F32 scalars/vectors; arrays carry the layer in the last component.
-    const int n = type == IR::Type::F32 ? 1 : type == IR::Type::F32x2 ? 2
-                                          : type == IR::Type::F32x3 ? 3
-                                                                    : 4;
-    if (n == 1) {
-        return fmt::format("vec2<f32>({}, 0.0f)", c);
+    // Coordinates arrive as F32 scalars/vectors: the spatial ones, then an array's layer. 1D
+    // images are 2D textures one texel high here.
+    const int n = NumComponents(type);
+    if (n == 1 || img.is_1d) {
+        return fmt::format("vec2<f32>({}, 0.0f)", n == 1 ? c : fmt::format("({}).x", c));
     }
     if (img.coord_dims == 3) {
         return n >= 3 ? fmt::format("({}).xyz", c) : fmt::format("vec3<f32>({}, 0.0f)", c);
@@ -740,9 +786,13 @@ std::string Emitter::SampleCoords(const ImageDesc& img, const std::string& c, IR
     return n == 2 ? c : fmt::format("({}).xy", c);
 }
 
-std::string Emitter::ArrayLayer(const ImageDesc& img, const std::string& c) {
-    const char comp = img.coord_dims == 3 ? 'w' : 'z';
-    return fmt::format("i32(round(({}).{}))", c, comp);
+std::string Emitter::ArrayLayer(const ImageDesc& img, const std::string& c, IR::Type type) {
+    // The component after the spatial ones; layer 0 if the coordinates don't have one.
+    const int spatial = img.is_1d ? 1 : img.coord_dims;
+    if (NumComponents(type) <= spatial) {
+        return "0";
+    }
+    return fmt::format("i32(round(({}).{}))", c, kSwizzle[spatial]);
 }
 
 void Emitter::EmitImageOp(const IR::Inst& inst) {
@@ -777,32 +827,35 @@ void Emitter::EmitImageOp(const IR::Inst& inst) {
                                            coords, t)
                              : fmt::format("vec2<i32>(floor({} * vec2<f32>(textureDimensions({}))))",
                                            coords, t);
-        const std::string layer = img.is_array ? ", " + ArrayLayer(img, c) : "";
+        const std::string layer = img.is_array ? ", " + ArrayLayer(img, c, coords_type) : "";
         L("{} = {};", dst,
           ResultF32x4(img, fmt::format("textureLoad({}, {}{}, 0)", t, ic, layer)));
+        ApplySwizzle(img, dst);
         return;
     }
-    if (img.is_storage && op != IR::Opcode::ImageWrite && op != IR::Opcode::ImageQueryDimensions) {
+    if (img.is_storage && op != IR::Opcode::ImageWrite && op != IR::Opcode::ImageQueryDimensions &&
+        op != IR::Opcode::ImageRead) {
         Error(fmt::format("{} on a written image", op));
         return;
     }
-    const std::string layer = img.is_array ? ", " + ArrayLayer(img, c) : "";
+    const std::string layer = img.is_array ? ", " + ArrayLayer(img, c, coords_type) : "";
     const std::string coords = c.empty() ? "" : SampleCoords(img, c, coords_type);
 
     switch (op) {
     case IR::Opcode::ImageSampleImplicitLod: {
-        const std::string bias = A(inst, 2);
         if (!fragment) {
             L("{} = textureSampleLevel({}, {}, {}{}, 0.0f);", dst, t, s, coords, layer);
         } else if (flags.has_bias) {
-            L("{} = textureSampleBias({}, {}, {}{}, {});", dst, t, s, coords, layer, bias);
+            L("{} = textureSampleBias({}, {}, {}{}, {});", dst, t, s, coords, layer, A(inst, 2));
         } else {
             L("{} = textureSample({}, {}, {}{});", dst, t, s, coords, layer);
         }
+        ApplySwizzle(img, dst);
         return;
     }
     case IR::Opcode::ImageSampleExplicitLod:
         L("{} = textureSampleLevel({}, {}, {}{}, {});", dst, t, s, coords, layer, A(inst, 2));
+        ApplySwizzle(img, dst);
         return;
     case IR::Opcode::ImageSampleDrefImplicitLod:
         if (fragment) {
@@ -822,8 +875,35 @@ void Emitter::EmitImageOp(const IR::Inst& inst) {
         if (img.is_depth) {
             L("{} = textureGather({}, {}, {}{});", dst, t, s, coords, layer);
         } else {
-            L("{} = textureGather({}, {}, {}, {}{});", dst, flags.gather_comp.Value(), t, s,
-              coords, layer);
+            // The component is picked after the T#'s selection: gather what it selects.
+            u32 comp = flags.gather_comp.Value();
+            std::string constant;
+            if (!img.swizzle.empty()) {
+                const std::string sel = fmt::format(fmt::runtime(img.swizzle), "v");
+                // "vec4<f32>(a, b, c, d)" -> the comp'th argument
+                std::vector<std::string> args;
+                std::string arg;
+                for (char ch : sel.substr(10, sel.size() - 11)) {
+                    if (ch == ',') {
+                        args.push_back(arg);
+                        arg.clear();
+                    } else if (ch != ' ') {
+                        arg.push_back(ch);
+                    }
+                }
+                args.push_back(arg);
+                const std::string& pick = args[comp & 3];
+                if (pick.size() == 3 && pick[0] == 'v') {
+                    comp = std::string_view("xyzw").find(pick[2]);
+                } else {
+                    constant = pick;
+                }
+            }
+            if (!constant.empty()) {
+                L("{} = vec4<f32>({});", dst, constant);
+            } else {
+                L("{} = textureGather({}, {}, {}, {}{});", dst, comp, t, s, coords, layer);
+            }
         }
         return;
     case IR::Opcode::ImageGatherDref:
@@ -833,6 +913,7 @@ void Emitter::EmitImageOp(const IR::Inst& inst) {
         L("{} = textureSampleGrad({}, {}, {}{}, {}, {});", dst, t, s, coords, layer,
           SampleCoords(img, A(inst, 2), inst.Arg(2).Type()),
           SampleCoords(img, A(inst, 3), inst.Arg(3).Type()));
+        ApplySwizzle(img, dst);
         return;
     case IR::Opcode::ImageQueryDimensions: {
         if (img.is_storage) {
@@ -872,15 +953,24 @@ void Emitter::EmitImageOp(const IR::Inst& inst) {
         std::string lay;
         if (n == 1) {
             ic = fmt::format("vec2<i32>(i32({}), 0)", c);
+        } else if (img.is_1d) {
+            ic = fmt::format("vec2<i32>(i32(({}).x), 0)", c);
+            lay = img.is_array ? fmt::format(", i32(({}).y)", c) : "";
         } else if (img.coord_dims == 3) {
             ic = fmt::format("vec3<i32>(({}).xyz)", c);
         } else {
             ic = fmt::format("vec2<i32>(({}).xy)", c);
             if (img.is_array && n >= 3) {
                 lay = fmt::format(", i32(({}).z)", c);
-            } else if (img.is_array) {
-                lay = ", 0";
             }
+        }
+        if (img.is_array && lay.empty()) {
+            lay = ", 0";
+        }
+        if (img.is_storage) {
+            // Storage textures have one mip level and no level argument.
+            L("{} = {};", dst, ResultF32x4(img, fmt::format("textureLoad({}, {}{})", t, ic, lay)));
+            return;
         }
         const std::string lod = img.is_msaa ? A(inst, 3) : A(inst, 2);
         if (img.is_depth) {
@@ -889,6 +979,7 @@ void Emitter::EmitImageOp(const IR::Inst& inst) {
         } else {
             L("{} = {};", dst,
               ResultF32x4(img, fmt::format("textureLoad({}, {}{}, i32({}))", t, ic, lay, lod)));
+            ApplySwizzle(img, dst);
         }
         return;
     }
@@ -901,13 +992,19 @@ void Emitter::EmitImageOp(const IR::Inst& inst) {
         std::string lay;
         if (n == 1) {
             ic = fmt::format("vec2<i32>(i32({}), 0)", c);
+        } else if (img.is_1d) {
+            ic = fmt::format("vec2<i32>(i32(({}).x), 0)", c);
+            lay = img.is_array ? fmt::format(", i32(({}).y)", c) : "";
         } else if (img.coord_dims == 3) {
             ic = fmt::format("vec3<i32>(({}).xyz)", c);
         } else {
             ic = fmt::format("vec2<i32>(({}).xy)", c);
-            if (img.is_array) {
-                lay = n >= 3 ? fmt::format(", i32(({}).z)", c) : ", 0";
+            if (img.is_array && n >= 3) {
+                lay = fmt::format(", i32(({}).z)", c);
             }
+        }
+        if (img.is_array && lay.empty()) {
+            lay = ", 0";
         }
         const std::string color = A(inst, 4);
         const std::string value = img.is_integer
@@ -2271,42 +2368,27 @@ void Emitter::EmitEntryPoint() {
     std::string& d = decls;
     switch (info.sw_stage) {
     case SwStage::Vertex: {
+        // Attributes come from the fetch shader, translated inline as buffer loads, so the only
+        // inputs are the vertex and instance index. This entry point is for checking the
+        // program on its own; draws use LinkVertexShader's.
         d += "var<private> in_vertex_index: u32;\nvar<private> in_instance_index: u32;\n";
         d += "var<private> out_position: vec4<f32>;\n";
-        std::string params = "@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32";
-        std::string copy_in = "    in_vertex_index = vi;\n    in_instance_index = ii;\n";
-        Gcn::FetchShaderData fetch;
-        if (Gcn::ParseFetchShader(info, fetch)) {
-            for (u32 sem = 0; sem < fetch.attributes.size(); sem++) {
-                const auto& attr = fetch.attributes[sem];
-                const auto sharp = attr.GetSharp(info);
-                const auto nfmt = sharp.GetNumberFmt();
-                const bool is_int =
-                    nfmt == AmdGpu::NumberFormat::Uint || nfmt == AmdGpu::NumberFormat::Sint;
-                const bool is_signed = nfmt == AmdGpu::NumberFormat::Sint;
-                const std::string t = is_int ? (is_signed ? "vec4<i32>" : "vec4<u32>") : "vec4<f32>";
-                d += fmt::format("var<private> in_param{}: vec4<f32>;\n", sem);
-                params += fmt::format(", @location({}) a{}: {}", sem, sem, t);
-                copy_in += is_int ? fmt::format("    in_param{} = bitcast<vec4<f32>>(a{});\n", sem, sem)
-                                  : fmt::format("    in_param{} = a{};\n", sem, sem);
-                out.vertex_inputs.push_back({sem, attr.dest_vgpr, attr.num_elements, is_int,
-                                             is_signed});
-            }
-        }
         std::string fields = "    @builtin(position) position: vec4<f32>,\n";
         std::string copy_out = "    o.position = out_position;\n";
         for (u32 i = 0; i < IR::NumParams; i++) {
             if (!info.stores.GetAny(IR::Attribute::Param0 + i)) {
                 continue;
             }
+            out.param_mask |= 1u << i;
             d += fmt::format("var<private> out_param{}: vec4<f32>;\n", i);
             fields += fmt::format("    @location({}) param{}: vec4<f32>,\n", i, i);
             copy_out += fmt::format("    o.param{} = out_param{};\n", i, i);
         }
         e += fmt::format("struct VsOut {{\n{}}}\n", fields);
-        e += fmt::format("@vertex\nfn main({}) -> VsOut {{\n{}    shader_main();\n    var o: "
-                         "VsOut;\n{}    return o;\n}}\n",
-                         params, copy_in, copy_out);
+        e += fmt::format("@vertex\nfn main(@builtin(vertex_index) vi: u32, @builtin(instance_index) "
+                         "ii: u32) -> VsOut {{\n    in_vertex_index = vi;\n    in_instance_index = "
+                         "ii;\n    shader_main();\n    var o: VsOut;\n{}    return o;\n}}\n",
+                         copy_out);
         break;
     }
     case SwStage::Fragment: {
@@ -2327,16 +2409,38 @@ void Emitter::EmitEntryPoint() {
             if (!info.loads.GetAny(IR::Attribute::Param0 + i)) {
                 continue;
             }
-            u32 location = i;
+            u32 param = i;
             bool flat = false;
             if (i < rt.hw.fs.num_inputs) {
                 const auto& input = rt.hw.fs.inputs[i];
-                location = input.param_index;
+                param = input.param_index;
                 flat = input.is_flat;
             }
+            const u32 location = static_cast<u32>(out.inputs.size());
+            // The vertex stage's output has to be declared the same way (LinkVertexShader).
+            const auto& interp = info.fs_interpolation[i];
+            std::string mode;
+            if (flat || interp.primary == Qualifier::Flat) {
+                mode = "flat";
+            } else {
+                if (interp.primary == Qualifier::PerVertex) {
+                    Error("per-vertex fragment input (needs barycentrics)");
+                }
+                const char* type =
+                    interp.primary == Qualifier::NoPerspective ? "linear" : "perspective";
+                const char* sampling = interp.auxiliary == Qualifier::Centroid ? "centroid"
+                                       : interp.auxiliary == Qualifier::Sample ? "sample"
+                                                                               : "";
+                if (*sampling) {
+                    mode = fmt::format("{}, {}", type, sampling);
+                } else if (interp.primary == Qualifier::NoPerspective) {
+                    mode = type;
+                }
+            }
+            out.inputs.push_back({location, param, mode});
             d += fmt::format("var<private> in_param{}: vec4<f32>;\n", i);
             params += fmt::format(", @location({}){} p{}: vec4<f32>", location,
-                                  flat ? " @interpolate(flat)" : "", i);
+                                  mode.empty() ? "" : fmt::format(" @interpolate({})", mode), i);
             copy_in += fmt::format("    in_param{} = p{};\n", i, i);
         }
         std::string fields;
@@ -2401,6 +2505,7 @@ void Emitter::EmitEntryPoint() {
 }
 
 Output Emitter::Run() {
+    out.group = group;
     Prepass();
     EmitDeclarations();
     Traverse();
@@ -2428,6 +2533,7 @@ Output Emitter::Run() {
     }
     code += body;
     code += "}\n\n";
+    out.code_without_entry = code;
     code += entry;
     if (uses_f64) {
         code += "// note: 64-bit floats are evaluated in 32-bit precision\n";
@@ -2437,6 +2543,112 @@ Output Emitter::Run() {
 }
 
 } // namespace
+
+std::string StorageTexelFormat(AmdGpu::DataFormat dfmt, AmdGpu::NumberFormat nfmt) {
+    using DF = AmdGpu::DataFormat;
+    using NF = AmdGpu::NumberFormat;
+    const bool u = nfmt == NF::Uint;
+    const bool s = nfmt == NF::Sint;
+    const bool sn = nfmt == NF::Snorm;
+    const bool f = nfmt == NF::Float;
+    // Unorm and sRGB images store the same bits: GCN image stores don't encode sRGB.
+    const bool un = nfmt == NF::Unorm || nfmt == NF::Srgb;
+    const auto pick = [&](const char* unorm, const char* snorm, const char* uint, const char* sint,
+                          const char* flt) -> std::string {
+        const char* r = un ? unorm : sn ? snorm : u ? uint : s ? sint : f ? flt : nullptr;
+        return r ? r : "";
+    };
+    switch (dfmt) {
+    case DF::Format8:
+        return pick("r8unorm", "r8snorm", "r8uint", "r8sint", nullptr);
+    case DF::Format8_8:
+        return pick("rg8unorm", "rg8snorm", "rg8uint", "rg8sint", nullptr);
+    case DF::Format8_8_8_8:
+        return pick("rgba8unorm", "rgba8snorm", "rgba8uint", "rgba8sint", nullptr);
+    case DF::Format16:
+        return pick("r16unorm", "r16snorm", "r16uint", "r16sint", "r16float");
+    case DF::Format16_16:
+        return pick("rg16unorm", "rg16snorm", "rg16uint", "rg16sint", "rg16float");
+    case DF::Format16_16_16_16:
+        return pick("rgba16unorm", "rgba16snorm", "rgba16uint", "rgba16sint", "rgba16float");
+    case DF::Format32:
+        return pick(nullptr, nullptr, "r32uint", "r32sint", "r32float");
+    case DF::Format32_32:
+        return pick(nullptr, nullptr, "rg32uint", "rg32sint", "rg32float");
+    case DF::Format32_32_32_32:
+        return pick(nullptr, nullptr, "rgba32uint", "rgba32sint", "rgba32float");
+    case DF::Format2_10_10_10:
+        return pick("rgb10a2unorm", nullptr, "rgb10a2uint", nullptr, nullptr);
+    case DF::Format10_11_11:
+        return f ? "rg11b10ufloat" : "";
+    default:
+        return "";
+    }
+}
+
+std::string LinkVertexShader(const Output& vs, const VertexLink& link) {
+    std::string c = vs.code_without_entry;
+    c += "struct DrawInfo {\n    vx: vec4<f32>,\n    vy: vec4<f32>,\n    vz: vec4<f32>,\n    pad: "
+         "vec4<u32>,\n}\n@group(2) @binding(0) var<uniform> draw_info: DrawInfo;\n";
+    if (link.rect_list) {
+        c += "@group(2) @binding(1) var<storage, read> rect_indices: array<u32>;\n";
+    }
+    std::string fields = "    @builtin(position) position: vec4<f32>,\n";
+    std::string copy;
+    std::string reset;
+    std::string fourth = "    o.position = a.position + b.position - k.position;\n";
+    for (const auto& in : link.inputs) {
+        fields += fmt::format("    @location({}){} p{}: vec4<f32>,\n", in.location,
+                              in.interpolation.empty()
+                                  ? ""
+                                  : fmt::format(" @interpolate({})", in.interpolation),
+                              in.location);
+        const bool written = in.param < 32 && (vs.param_mask >> in.param) & 1;
+        copy += written ? fmt::format("    o.p{} = out_param{};\n", in.location, in.param)
+                        : fmt::format("    o.p{} = vec4<f32>(0.0f);\n", in.location);
+        fourth += fmt::format("    o.p{0} = a.p{0} + b.p{0} - k.p{0};\n", in.location);
+    }
+    for (u32 i = 0; i < 32; i++) {
+        if ((vs.param_mask >> i) & 1) {
+            reset += fmt::format("    out_param{} = vec4<f32>(0.0f);\n", i);
+        }
+    }
+    c += fmt::format("struct VsOut {{\n{}}}\n", fields);
+    // The guest's position goes through its viewport transform into clip space for a viewport
+    // that covers the render target (DrawInfo). Outputs are reset first: a rectangle list runs
+    // the program more than once per invocation.
+    c += fmt::format(
+        "fn vs_run(vi: u32, ii: u32) -> VsOut {{\n    in_vertex_index = vi;\n    in_instance_index "
+        "= ii;\n    out_position = vec4<f32>(0.0f, 0.0f, 0.0f, 1.0f);\n{}    shader_main();\n    "
+        "var o: VsOut;\n    let p = out_position;\n    o.position = vec4<f32>(p.x * draw_info.vx.x "
+        "+ p.w * draw_info.vx.y + draw_info.vx.z, p.y * draw_info.vy.x + p.w * draw_info.vy.y + "
+        "draw_info.vy.z, p.z * draw_info.vz.x + p.w * draw_info.vz.y + draw_info.vz.z, p.w);\n{}"
+        "    return o;\n}}\n",
+        reset, copy);
+    if (!link.rect_list) {
+        c += "@vertex\nfn main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) "
+             "-> VsOut {\n    return vs_run(vi, ii);\n}\n";
+        return c;
+    }
+    // Two triangles per rectangle: the guest's three vertices, then the two that aren't its
+    // corner (the one sharing x with one neighbour and y with the other) and the fourth vertex,
+    // opposite that corner - as upstream's rect-list tessellation shader computes it.
+    c += fmt::format(
+        "@vertex\nfn main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> "
+        "VsOut {{\n    let base = (vi / 6u) * 3u;\n    let corner = vi % 6u;\n    if (corner < 3u) "
+        "{{\n        return vs_run(rect_indices[base + corner], ii);\n    }}\n    let o0 = "
+        "vs_run(rect_indices[base], ii);\n    let o1 = vs_run(rect_indices[base + 1u], ii);\n    "
+        "let o2 = vs_run(rect_indices[base + 2u], ii);\n    let e01 = o0.position.xy == "
+        "o1.position.xy;\n    let e12 = o1.position.xy == o2.position.xy;\n    let e20 = "
+        "o2.position.xy == o0.position.xy;\n    let c1 = (e12.x && e01.y) || (e12.y && e01.x);\n "
+        "   let c2 = (e20.x && e12.y) || (e20.y && e12.x);\n    var k = o0;\n    var a = o1;\n    "
+        "var b = o2;\n    if (c1) {{\n        k = o1;\n        a = o2;\n        b = o0;\n    }} "
+        "else if (c2) {{\n        k = o2;\n        a = o0;\n        b = o1;\n    }}\n    if "
+        "(corner == 3u) {{\n        return a;\n    }}\n    if (corner == 4u) {{\n        return "
+        "b;\n    }}\n    var o: VsOut;\n{}    return o;\n}}\n",
+        fourth);
+    return c;
+}
 
 Profile MakeProfile() {
     Profile p{};

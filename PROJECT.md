@@ -24,7 +24,7 @@ browser exposes Vulkan.
 | M5 | Wiring into shadPS4 | **Done for everything a game hits on boot**: `RunMainEntry`, module start, threads (`_runOnAnotherStack`), TLS (`fs:`), `pthread_once`/cleanup/key destructors, guest signal handlers, guest malloc for TLS, savedata/IME callbacks. Other guest callbacks (fonts, ngs2, AvPlayer, ...) are routed the same way (`Core::ExecuteGuest`) as they turn up |
 | M6 | Emscripten/CMake build | **Done**: `emscripten/CMakeLists.txt` compiles upstream shadPS4's own sources (common, core, ~200 HLE libraries, the GPU command processor) for wasm64 + pthreads; Node and browser targets |
 | M7 | SSE/AVX, string instructions | **Done** (folded into M1) |
-| M8 | Vulkan -> web graphics | **Started**: a WGSL backend for shadPS4's shader recompiler (all 43 of Bully's shaders the recompiler handles pass WebGPU validation); guest compute dispatches run on WebGPU with their results written back to guest memory (`tests/gpu`, in Chromium); frames reach the canvas through WebGPU, WebGL2 or a 2D canvas. **Not started**: draws (graphics pipelines, render targets, textures), so GPU-rendered games still show a black screen |
+| M8 | Vulkan -> web graphics | **Draws and compute run on WebGPU**: GCN shaders recompiled to WGSL; graphics pipelines from the Liverpool state, render targets, depth/stencil, blending, textures (detiled and converted on the CPU), samplers, fast clears, every primitive type (the ones WebGPU lacks emulated), indirect draws; compute with buffers, textures and written images; display buffers read back from the GPU at flip. Checked pixel by pixel in `tests/gpu` (Chromium and Node/Dawn), and Bloodborne renders through it (see below). **Not yet**: geometry/tessellation stages (WebGPU has neither), MSAA, writing GPU results back to guest memory for the CPU |
 | M9 | Frontend ([shadps4_web](https://github.com/Shubin123/shadps4_web)) | **Done for loading and running**: pick an extracted game folder, start, live log, canvas, keyboard -> pad. Playwright test drives it in headless Chromium |
 
 ## Bully (CUSA03507), end to end
@@ -43,7 +43,7 @@ its JIT (a second process), `image/disc01.iso` is the PS2 disc.
   during JitProc revision check`: the handshake with its JIT compiler process. shadPS4 doesn't
   implement PS4 JIT shared memory (`sceKernelJitCreateSharedMemory` & co. are stubs) or running a
   second guest process, natively or here, so Bully can't get further on shadPS4 at all until
-  upstream does. Even then nothing would be visible here until M8 can draw.
+  upstream does.
 
 Reproduce:
 ```
@@ -51,6 +51,32 @@ tools/extract_pkg.py UP9000-CUSA03507_00-SLUS212690000001-A0100-V0102.pkg ../gam
 scripts/run_node.sh ../games/ps4/CUSA03507/eboot.bin 180          # Node, log in build/run/out.txt
 cd ../shadps4_web && node tests/e2e.mjs ../games/ps4/CUSA03507 "IOP Flat Memory" 300   # browser
 ```
+
+## Bloodborne (CUSA03173), end to end
+
+The EU release, version 01.00 (Paleblood's replacements are for 01.09, so they stay off; the
+loader says so). Its 30GB of files are too much for the browser's in-memory filesystem, so it
+runs in the Node build on Dawn's WebGPU (`scripts/run_node.sh`), reading the game from disk:
+
+- It boots: modules load, `main` runs, threads start, its network setup gets "no network"
+  answers from the offline libSceNet instead of a NULL errno pointer (which crashed it before),
+  and it streams its data (`dvdroot_ps4/...`) through the file system.
+- Its GPU work runs on WebGPU: compute passes writing lookup tables and images, a depth-only pass
+  and a colour-grading pass over the display buffers. In the first 32 submits, 92 of 92 draws and
+  275 of 275 dispatches ran, and every flip was read back from the GPU.
+- What's on screen in the first minutes is uniform mid-gray. That is what the guest's buffers
+  hold: the grading pass reads a 1920x1080 buffer the game filled with `0xFF808080` before any GPU
+  work (traced with `SHADPS4_WEBGPU_TRACE=1`) and maps it through its lookup tables. At the
+  interpreter's speed - seconds per frame - the game was still loading its menus after several
+  minutes, before drawing its logos.
+
+```
+tools/extract_pkg.py CUSA03173.pkg ../games/ps4/CUSA03173
+scripts/run_node.sh ../games/ps4/CUSA03173/eboot.bin 1800       # frames in build/run/frames
+```
+
+`SHADPS4_WEBGPU_TRACE=1` logs every draw (shaders, targets, bindings) and texture upload;
+`SHADPS4_WGSL_DUMP=dir` writes every translated shader.
 
 ## Layout
 
@@ -60,8 +86,8 @@ emscripten/CMakeLists.txt    the wasm build (targets: shadps4, shadps4_node, int
                              translate_shaders, gpu_tests)
 emscripten/pre.js            alert() shim for Node/workers (SDL message boxes); a page's
                              environment variables (Module.shadps4Env) for getenv
-emscripten/webgpu.js         the page-side WebGPU device and compute job executor
-patches/0001-emscripten.patch   changes to upstream files (35 files, all behind ARCH_WASM)
+emscripten/webgpu.js         the page-side WebGPU device and the batch executor (draws, dispatches, ...)
+patches/0001-emscripten.patch   changes to upstream files (36 files, all behind ARCH_WASM)
 patches/new_files/           new sources, laid out like upstream's src/
   core/interpreter/            the interpreter, HLE thunks, host->guest calls
   core/wasm_layout.h           guest address layout inside linear memory
@@ -72,19 +98,24 @@ patches/new_files/           new sources, laid out like upstream's src/
   core/paleblood/              Paleblood's game function replacements: hook installer, and the
                                runtime interface they're written against, on the interpreter
   shader_recompiler/backend/wgsl/   IR -> WGSL (the SPIR-V backend's counterpart)
-  video_core/renderer_web/     Presenter/Rasterizer stand-ins, WebGPU bridge, compute pipelines
-  web/                         main, window/input, frame hand-off, stubs for excluded libraries
+  video_core/renderer_web/     Presenter/Rasterizer stand-ins and the WebGPU renderer: batches
+                               (web_gpu), shader cache, draws (web_graphics), compute, resource
+                               binding, surfaces (textures/render targets), CPU detiler
+  web/                         main, window/input, frame hand-off, offline libSceNet/NetCtl,
+                               stubs for excluded libraries
 scripts/setup_tree.sh        build/patched = upstream src/ + patches, as a git repo
 scripts/export_patches.sh    build/patched's diff -> patches/0001-emscripten.patch
 scripts/build_wasm.sh        configure + build
-scripts/run_node.sh          run a game headlessly under Node
+scripts/run_node.sh          run a game headlessly under Node (on Dawn's WebGPU when installed)
+scripts/node_webgpu.mjs      gives Node a WebGPU implementation (`webgpu` package, Dawn)
 scripts/sync_paleblood.sh    Paleblood checkout -> third_party/paleblood
 third_party/paleblood/       Paleblood (Bloodborne decompilation), the parts the build compiles
 tools/extract_pkg.py         fPKG -> game folder (upstream removed its extractor)
 tools/paleblood_port.py      third_party/paleblood -> build tree, ported for interpretation
 tests/interpreter/           guest_code.s -> guest_code.inc (gen_guest_code.sh), test_main.cpp
 tests/shaders/               a game's GCN shaders -> WGSL -> WebGPU validation
-tests/gpu/                   hand-assembled GCN compute programs dispatched on WebGPU
+tests/gpu/                   hand-assembled GCN dispatches and draws on WebGPU, checked pixel
+                             by pixel
 ```
 
 ## Build and test
@@ -100,11 +131,14 @@ scripts/setup_tree.sh
 scripts/build_wasm.sh                      # all targets, into build/wasm
 node build/wasm/interpreter_tests.js       # 27/27 + a throughput line
 tests/shaders/run_shader_tests.sh ../games/ps4/CUSA03507/eboot.bin   # WGSL for a game's shaders
-node tests/gpu/run_gpu_tests.mjs           # WebGPU compute, in headless Chromium
+node tests/gpu/run_gpu_tests.mjs           # WebGPU dispatches and draws, in headless Chromium
+(cd build/wasm && SHADPS4_GPU_TEST_ENV=page node --import ../../scripts/node_webgpu.mjs gpu_tests_node.js)
+                                           # the same under Node, on Dawn
 ```
 
-The two browser-side scripts use the Playwright install in the sibling `shadps4_web` checkout
-(`npm install` there) or `PLAYWRIGHT_DIR`.
+The browser-side scripts use the Playwright install in the sibling `shadps4_web` checkout
+(`npm install` there) or `PLAYWRIGHT_DIR`; the Node GPU runs use the `webgpu` package installed
+there too, or `NODE_WEBGPU_DIR`.
 
 Developing: edit files in `build/patched/src` (a git repo whose `upstream` tag is pristine), then
 `scripts/export_patches.sh`. New files go straight into `patches/new_files`.
@@ -215,14 +249,16 @@ interpreter with it) through the rest of each frame.
 `video_core/renderer_web` replaces `Vulkan::Presenter` and `Vulkan::Rasterizer` (same names and
 interface, selected by the two Vulkan headers under `ARCH_WASM`):
 
-- **Presenter**: reads VideoOut buffers from guest memory, converts A8R8G8B8/A8B8G8R8/A2R10G10B10
-  to RGBA8, and hands frames to the page (`web/web_display.cpp`) - or to PPM files under Node
-  with `SHADPS4_FRAME_DUMP=dir`. Tiled framebuffers are shown as if linear (there's no CPU
-  detiler yet). The page draws them with WebGPU, falling back to WebGL2 and then a 2D canvas
-  (`gpu_presenter.js` in shadps4_web).
 - **Rasterizer**: the GPU command processor (`AmdGpu::Liverpool`, upstream, unmodified) runs
-  and calls it. DMA fills/copies and GDS reads run on the CPU, compute dispatches run on WebGPU
-  (below), and draws are counted and dropped.
+  and calls it. Draws and compute dispatches run on WebGPU, recorded into a batch that goes to
+  the page at the end of each submit (below). DMA fills/copies and GDS reads run on the CPU and
+  tell the renderer which guest memory changed.
+- **Presenter**: at each flip, the VideoOut buffer is read back from the GPU if the guest
+  rendered it there (or a shader wrote it), otherwise read from guest memory, detiled on the
+  CPU if it's tiled. Either way it's converted to RGBA8 and handed to the page
+  (`web/web_display.cpp`), or to PPM files under Node with `SHADPS4_FRAME_DUMP=dir`. The page
+  draws frames with WebGPU, falling back to WebGL2 and then a 2D canvas (`gpu_presenter.js` in
+  shadps4_web).
 
 ### Shaders: GCN -> WGSL
 
@@ -230,8 +266,10 @@ Browsers' WebGPU takes WGSL only, so instead of converting the SPIR-V backend's 
 second backend emits WGSL from the same recompiler IR (`shader_recompiler/backend/wgsl`):
 frontend, SRT flattening and optimization passes are upstream's, unchanged (the SRT walker that
 upstream generates as x86-64 with Xbyak runs in the interpreter). The backend mirrors the SPIR-V
-resource model: one `@group(0)` binding per `Info` buffer/image/sampler, in that order. Anything
-it can't express yet is returned as an error, not emitted wrong. The cases worth knowing:
+resource model: one binding per `Info` buffer/image/sampler, in that order, in `@group(0)` for
+compute and vertex shaders and `@group(1)` for pixel shaders, so a draw's two stages share a
+pipeline layout. Anything it can't express yet is returned as an error, not emitted wrong. The
+cases worth knowing:
 
 - No 64-bit types in WGSL: U64 is `vec2<u32>` with helper arithmetic, F64 is computed as f32.
 - Barriers need uniform control flow, but GCN barriers apply to the whole wave, whatever its
@@ -239,8 +277,22 @@ it can't express yet is returned as an error, not emitted wrong. The cases worth
   contains a barrier keeps every invocation iterating, with finished ones' work predicated off,
   and exits on a workgroup-wide vote (`workgroupUniformLoad`) once no invocation is still
   active - the same trip count the wave had on GCN.
+- Vertex shaders fetch their own attributes: the wasm build translates the fetch shader inline
+  (upstream's `inline_fetch_shader` option, always on), as buffer loads indexed by the vertex
+  id. WebGPU's vertex formats and strides are narrower than the guest's, and rectangle lists
+  need vertices fetched by computed index.
+- A vertex shader's entry point is made per draw (`LinkVertexShader`): its outputs must match
+  the pixel shader's inputs exactly, interpolation included (ones the program doesn't write are
+  zero), the guest's viewport transform is applied there (WebGPU viewports must lie inside the
+  render target, guest ones needn't), and rectangle lists are expanded there: each rectangle is
+  two triangles, its fourth corner computed from the other three as upstream's tessellation
+  shader does.
+- Sampled images get the T#'s component swizzle applied in the shader (WebGPU texture views
+  have none). Written images are storage textures in the WebGPU format matching the guest's
+  (`StorageTexelFormat`; several need the `texture-formats-tier1` feature, reading back what's
+  written needs tier2). Cube maps a shader writes are 2D arrays of faces, as GCN addresses them.
 - Integer textures can't be sampled, only loaded; depth textures used with comparisons are
-  declared as `texture_depth_*`.
+  declared as `texture_depth_*`; 1D images are 2D textures one texel high.
 
 `tests/shaders` pulls every shader out of a game's eboot (by the `OrbShdr` footers), translates
 them one per process and compiles the WGSL in Chromium's WebGPU. Bully has 48: 43 translate and
@@ -248,35 +300,91 @@ validate, and 5 hit upstream recompiler limits that native shadPS4 shares (unimp
 `DS_READ_U8/I8`, a fetch shader that needs draw-time state, an SRT walker reading through a null
 pointer when given zeroed user data).
 
-### Compute on WebGPU
+### Batches
 
 The device lives on the page's main thread, because WebGPU's promises only settle on a thread
 whose event loop runs, and the emulator's threads are pthreads busy in C++.
-`emscripten/webgpu.js` requests a device before the runtime starts. `Web::Gpu`
-(`web_gpu.cpp`) posts a job to the main thread and blocks on a futex word until the job's
-results are back in linear memory.
+`emscripten/webgpu.js` requests a device before the runtime starts (under Node, from Dawn's
+`webgpu` package: `scripts/node_webgpu.mjs`). Everything the renderer does is recorded on the
+command processor's thread as a batch (`web_gpu.h`): JSON commands (create a texture, upload
+into it, draw, dispatch, read back) plus an upload area holding the guest memory they read,
+copied when the command is recorded. A batch is posted to the main thread at the end of each
+submit and runs there strictly after the previous one, as one command encoder; consecutive draws
+into the same targets share a render pass. Nothing waits unless results are needed back in
+memory: a dispatch that writes guest buffers, and the presenter's readback. Shader modules and
+pipelines are created once and referred to by id after that (`web_shaders.h`).
 
-`Web::ComputePipelines` (`web_compute.cpp`) takes over from `vk_pipeline_cache`/`vk_rasterizer`
-for compute: it builds the RuntimeInfo from the COMPUTE_* registers, translates once per program
-and `StageSpecialization`, and binds each guest buffer (V#), the flattened user data and GDS.
-Each dispatch uploads its buffers from guest memory and copies the written ones back before
-returning, so the guest sees the results as soon as the command processor moves on. That's a
-round trip per dispatch. A GPU-resident buffer cache using the address space's dirty tracking
-is the obvious next step. Shaders that use textures or images aren't dispatched yet.
+### Draws
 
-`tests/gpu` checks the whole path in Chromium with hand-encoded GCN programs set up the way a
-game leaves the registers: an LDS exchange across `s_barrier` over four workgroups (and again
-with rebound buffers, through the cache), and a loop with per-lane trip counts and a barrier in
-its body.
+`Web::GraphicsPipelines` (`web_graphics.cpp`) does what `vk_rasterizer`'s `Draw` and
+`vk_pipeline_cache`'s graphics half do. It builds the vertex and pixel shaders' RuntimeInfo from
+the registers, translates them through the shader cache, and turns the fixed-function state into
+a WebGPU render pipeline: topology, culling and winding, depth/stencil test and ops, depth bias,
+per-target blending and write masks (swizzled like the export), unclipped depth when the guest
+disables Z clipping. What WebGPU lacks is emulated:
+
+- quads, quad strips, fans, polygons and line loops are rewritten as index lists on the CPU;
+  rectangle lists are drawn by the vertex shader as above;
+- the viewport transform runs in the vertex shader, against a viewport covering the target
+  (including the clip-disabled case, where positions arrive in window coordinates);
+- fast clears: CMASK/HTILE fills and clear shaders are noted (as upstream's texture cache does)
+  and the next draw into the target starts from its clear color or depth; depth/stencil clear
+  enables become load-op clears; fast-clear elimination and MSAA resolve are a clear and a copy;
+- indirect draws read their arguments from guest memory and write the base vertex/instance into
+  the vertex shader's user data, as the CP does.
+
+Not handled: geometry and tessellation stages (WebGPU has neither), MSAA (targets are rendered
+single-sampled), dual-source blending (the second output isn't produced), user clip distances,
+logic ops, stencil ops without a WebGPU equivalent, more than one viewport.
+
+### Surfaces
+
+`Web::Surfaces` (`web_surfaces.cpp`) holds the textures and render targets on the GPU, by guest
+address. Textures are uploaded from guest memory: detiled on the CPU (`web_tiling.cpp`, a C++
+port of upstream's GPU detiler `tiling.comp`, with `texture_cache/tile.h`'s sizes unchanged) and,
+where WebGPU has no equivalent format, converted (5:6:5 and other packed formats to RGBA8,
+16-bit normalized to half floats, 96-bit to 128). BC1-7 are uploaded as they are. Render targets
+and written images start from guest memory too, and from then on the GPU's copy is newer: a
+texture over the same memory samples it (a copy, if the T# covers less of it, or the draw also
+renders into it), and the presenter reads it back.
+
+Nothing is written back to guest memory. Without page protection there's no telling when the CPU
+writes, so content is compared instead: each surface remembers a hash of the guest memory it was
+last synced with, rechecked once per frame (and whenever a DMA writes over it). A texture whose
+memory changed is uploaded again. A render target whose memory changed was written by the CPU
+since the GPU last used it - the GPU never touches guest memory - and the CPU's version wins.
+The cost is that guest code reading back what the GPU rendered, or a DMA copying it, sees stale
+memory. A GPU-resident buffer cache would remove the per-batch buffer copies too.
+
+### Compute
+
+`Web::ComputePipelines` (`web_compute.cpp`) builds the RuntimeInfo from the COMPUTE_* registers
+and binds buffers, user data, GDS, textures and written images the same way as draws. A dispatch
+that writes guest buffers is waited for and the written ranges copied back, so the guest sees
+the results as soon as the command processor moves on; one that writes only images doesn't wait.
+Dispatches that clear render target metadata without computing tiled addresses (upstream's
+heuristic) are noted as fast clears instead of run.
+
+### Tests
+
+`tests/gpu` runs hand-encoded GCN programs, set up the way a game leaves the registers, through
+the real classes and the page's executor: in headless Chromium (`run_gpu_tests.mjs`) and under
+Node on Dawn (`gpu_tests_node.js`). Compute: an LDS exchange across `s_barrier` over four
+workgroups (and again with rebound buffers), and a loop with per-lane trip counts and a barrier
+in its body. Draws, through `Vulkan::Rasterizer` into a render target read back the way the
+presenter reads a display buffer and checked pixel by pixel: a vertex shader that fetches its
+attributes through a fetch shader called with `s_swappc` (as compiled PS4 vertex shaders do), a
+flat triangle, an interpolated quad list (auto-indexed and with a 16-bit index buffer), a
+rectangle list in window space over a CMASK fast clear, alpha blending over CPU-written content,
+a texture sampled from guest memory, and a compute shader writing an image, submitted as PM4
+through `Liverpool::SubmitGfx`.
 
 ### What's next
 
-Draws: a graphics pipeline cache keyed on the Liverpool state that matters (shaders,
-vertex/index formats, blend/depth/raster state, render-target formats), render targets and
-textures with detiling as compute shaders, and the presenter reading the guest's front buffer
-straight from the GPU instead of from guest memory. WebGL2 can't run WGSL or compute, so on
-browsers without WebGPU it stays a presentation fallback. Rendering there would need a GLSL ES
-backend and has no compute path.
+A buffer cache that keeps guest buffers on the GPU across batches, writing render targets back
+to guest memory when the CPU reads them, MSAA, and moving detiling and format conversion to
+compute shaders as upstream does. WebGL2 can't run WGSL or compute, so on browsers without
+WebGPU it stays a presentation fallback.
 
 ## What's excluded from the build, and why
 
@@ -286,7 +394,12 @@ the excluded HLE libraries empty `RegisterLib`s, so their NIDs fall back to the 
 hasn't written.
 
 - Networking and PSN (`libraries/net`, `network`, `np`, `rudp`, `core/net`): host sockets with
-  epoll/kqueue, OpenSSL, protobuf, cpp-httplib.
+  epoll/kqueue, the host's routing tables, OpenSSL, protobuf, cpp-httplib. In their place,
+  `web/net_web.cpp` makes libSceNet and libSceNetCtl answer like a console with no network:
+  errno, byte order and address text work, epoll objects exist and time out, sockets and DNS
+  fail with ENETDOWN, and NetCtl reports "disconnected". Leaving them as generic stubs isn't
+  enough, because games set up sockets at boot (Bloodborne dereferences the errno pointer the
+  stub returns as NULL).
 - Video/audio decoding (`avplayer`, `videodec`, `ajm`, `music`): FFmpeg.
 - USB (`usbd`): libusb. UPnP: miniupnpc.
 - The ImGui overlay renderer, Vulkan pipeline cache, RenderDoc, the debugger/devtools, IPC.

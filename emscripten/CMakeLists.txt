@@ -238,25 +238,28 @@ set(SHADPS4_LINK_FLAGS
     -sDEFAULT_PTHREAD_STACK_SIZE=2MB
     -sUSE_SDL=3 -sUSE_ZLIB=1 -sUSE_LIBPNG=1 -sUSE_FREETYPE=1
     -sEXPORTED_RUNTIME_METHODS=callMain,FS,UTF8ToString,HEAPU8
-    -sEXPORTED_FUNCTIONS=_main,_shadps4_display_release,_shadps4_pad_button,_shadps4_pad_axis,_shadps4_request_quit
+    -sEXPORTED_FUNCTIONS=_main,_shadps4_display_release,_shadps4_pad_button,_shadps4_pad_axis,_shadps4_request_quit,_shadps4_gpu_release
     -sMALLOC=mimalloc
     # pre.js fills ENV (getenv's environment) before main.
     "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$ENV"
     --profiling-funcs
     -Wl,--error-limit=0)
 
-# Node build, for headless runs and tests: the host filesystem is visible directly.
+# webgpu.js gives the page's WebGPU device to the renderer (video_core/renderer_web/web_gpu.h).
+set(WEBGPU_LINK_FLAGS "--pre-js=${CMAKE_CURRENT_LIST_DIR}/webgpu.js"
+    "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$ENV,$addRunDependency,$removeRunDependency")
+
+# Node build, for headless runs and tests: the host filesystem is visible directly. It renders
+# when Node has a WebGPU implementation (scripts/run_node.sh provides Dawn's when installed).
 add_executable(shadps4_node "${NEW_FILES}/web/main_web.cpp")
 target_link_libraries(shadps4_node PRIVATE shadps4_core)
 target_link_options(shadps4_node PRIVATE ${SHADPS4_LINK_FLAGS} -sNODERAWFS=1 -sEXIT_RUNTIME=1
-                    -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js")
+                    -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js"
+                    ${WEBGPU_LINK_FLAGS})
 
 # Browser build: the page mounts the game folder and drives main (see shadps4_web).
 add_executable(shadps4 "${NEW_FILES}/web/main_web.cpp")
 target_link_libraries(shadps4 PRIVATE shadps4_core)
-# webgpu.js gives the page's WebGPU device to the renderer (video_core/renderer_web/web_gpu.h).
-set(WEBGPU_LINK_FLAGS "--pre-js=${CMAKE_CURRENT_LIST_DIR}/webgpu.js"
-    "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$ENV,$addRunDependency,$removeRunDependency")
 target_link_options(shadps4 PRIVATE ${SHADPS4_LINK_FLAGS} -sINVOKE_RUN=0 -sMODULARIZE=1
                     -sEXPORT_NAME=createShadPS4 -sENVIRONMENT=web,worker
                     "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js" ${WEBGPU_LINK_FLAGS})
@@ -275,18 +278,28 @@ target_link_libraries(translate_shaders PRIVATE shadps4_core)
 target_link_options(translate_shaders PRIVATE ${SHADPS4_LINK_FLAGS} -sNODERAWFS=1 -sEXIT_RUNTIME=1
                     -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js")
 
-# WebGPU compute path (tests/gpu): GCN programs dispatched through Web::ComputePipelines in a
-# browser; `node tests/gpu/run_gpu_tests.mjs` serves the page and drives headless Chromium.
-add_executable(gpu_tests "${REPO_ROOT}/tests/gpu/compute_test.cpp")
+# WebGPU dispatches and draws (tests/gpu): hand-assembled GCN programs run through
+# Web::ComputePipelines and Vulkan::Rasterizer in a browser; `node tests/gpu/run_gpu_tests.mjs`
+# serves the page and drives headless Chromium.
+add_executable(gpu_tests "${REPO_ROOT}/tests/gpu/compute_test.cpp" "${REPO_ROOT}/tests/gpu/draw_test.cpp")
 target_link_libraries(gpu_tests PRIVATE shadps4_core)
 target_link_options(gpu_tests PRIVATE ${SHADPS4_LINK_FLAGS} -sEXIT_RUNTIME=1
                     -sENVIRONMENT=web,worker "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js"
                     ${WEBGPU_LINK_FLAGS})
 
+# The same tests under Node, on Dawn's WebGPU (scripts/node_webgpu.mjs):
+#   SHADPS4_GPU_TEST_ENV=page node --import scripts/node_webgpu.mjs build/wasm/gpu_tests_node.js
+add_executable(gpu_tests_node "${REPO_ROOT}/tests/gpu/compute_test.cpp"
+               "${REPO_ROOT}/tests/gpu/draw_test.cpp")
+target_link_libraries(gpu_tests_node PRIVATE shadps4_core)
+target_link_options(gpu_tests_node PRIVATE ${SHADPS4_LINK_FLAGS} -sNODERAWFS=1 -sEXIT_RUNTIME=1
+                    -sENVIRONMENT=node "--pre-js=${CMAKE_CURRENT_LIST_DIR}/pre.js"
+                    ${WEBGPU_LINK_FLAGS})
+
 # --pre-js files aren't link inputs as far as CMake knows; relink when they change.
-foreach(target shadps4_node shadps4 interpreter_tests translate_shaders gpu_tests)
+foreach(target shadps4_node shadps4 interpreter_tests translate_shaders gpu_tests gpu_tests_node)
     set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/pre.js")
 endforeach()
-foreach(target shadps4 gpu_tests)
+foreach(target shadps4_node shadps4 gpu_tests gpu_tests_node)
     set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/webgpu.js")
 endforeach()
