@@ -54,9 +54,13 @@ cd ../shadps4_web && node tests/e2e.mjs ../games/ps4/CUSA03507 "IOP Flat Memory"
 
 ## Bloodborne (CUSA03173), end to end
 
-The EU release, version 01.00 (Paleblood's replacements are for 01.09, so they stay off; the
-loader says so). Its 30GB of files are too much for the browser's in-memory filesystem, so it
-runs in the Node build on Dawn's WebGPU (`scripts/run_node.sh`), reading the game from disk:
+The EU release. Its 30GB of files are too much for the browser's in-memory filesystem, so it
+runs in the Node build on Dawn's WebGPU (`scripts/run_node.sh`), reading the game from disk.
+The results below are from version 01.00; with the 1.09 update next to it (as shadPS4 expects
+updates: extracted to a sibling `<game folder>-UPDATE`, whose files take precedence) the loader
+reports `App Version: 01.09`, loads the update's executable, and Paleblood installs all 32 of its
+replacements; the game then boots and renders the same way with them running. Upstream's macOS
+build (same revision) recognizes the same folder.
 
 - It boots: modules load, `main` runs, threads start, its network setup gets "no network"
   answers from the offline libSceNet instead of a NULL errno pointer (which crashed it before),
@@ -71,6 +75,7 @@ runs in the Node build on Dawn's WebGPU (`scripts/run_node.sh`), reading the gam
 
 ```
 tools/extract_pkg.py CUSA03173.pkg ../games/ps4/CUSA03173
+tools/extract_pkg.py CUSA03173-update-1.09.pkg ../games/ps4/CUSA03173-UPDATE   # optional
 scripts/run_node.sh ../games/ps4/CUSA03173/eboot.bin 1800       # frames in build/run/frames
 ```
 
@@ -239,9 +244,9 @@ interpreter with it) through the rest of each frame.
 - **Tested**: `tests/interpreter` hooks a guest function with a replacement written the
   Paleblood way. It checks that callers reach the replacement and that the replacement can call
   an original, read a global, call through a vtable slot in guest memory and read the thread
-  pointer. It also checks that a function too short for the jump is left alone. The 32
-  replacements themselves compile into the build, but running them takes Bloodborne, which this
-  repository doesn't test with.
+  pointer. It also checks that a function too short for the jump is left alone. With Bloodborne
+  1.09 (the base game plus its update), all 32 install and the game boots and renders with them
+  in place (see "Bloodborne, end to end").
 
 ## Graphics (M8)
 
