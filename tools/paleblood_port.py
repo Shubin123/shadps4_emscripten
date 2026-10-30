@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Prepare Paleblood's game replacements (third_party/paleblood) for the wasm build.
+"""Prepare Paleblood's game replacements (third_party/paleblood) for a shadPS4 build.
 
-usage: paleblood_port.py PALEBLOOD_DIR OUT_DIR
+usage: paleblood_port.py [--native] PALEBLOOD_DIR OUT_DIR
 
 Writes OUT_DIR/game/... (a copy of every game source and header, with the changes below) and
 OUT_DIR/paleblood_hooks.cpp (the hook table core/paleblood/paleblood.h declares).
 
-Paleblood's replacements run natively in the same process as the game's x86 code; here that code
-is interpreted, so two things in them can't stay as written:
+Paleblood's replacements run natively in the same process as the game's x86 code; in the wasm
+build that code is interpreted, so two things in them can't stay as written:
 
   * vtable slots, `R (*name)(Args);`, are called as native function pointers. They become
     `::rt::guest_fn<R(Args)> name;` (core/paleblood/port/runtime/original.h): the same 8 bytes,
@@ -20,6 +20,11 @@ Every rewrite must apply where expected, and no function-pointer declaration may
 another form, so a change upstream stops the build instead of producing a replacement that
 traps when it runs. Each replacement named in game/hooks.csv also gets an exported getter for its
 HLE thunk address (core/interpreter/hle.h), appended to the source that defines it.
+
+--native is for shadPS4's own x86-64 build (native/paleblood.cmake), where the game's code runs
+directly as it does under Paleblood's runtime: vtable slots stay function pointers, and the getter
+returns the replacement's own address. Only the thread pointer read changes, since shadPS4 keeps
+the guest's thread pointer at fs:[0] where Paleblood's loader moves it to gs:[0].
 """
 from __future__ import annotations
 
@@ -55,23 +60,25 @@ def add_include(text: str, line: str) -> str:
     return text[:m.start()] + line + text[m.start():]
 
 
-def port_source(rel: str, text: str) -> tuple[str, int]:
+def port_source(rel: str, text: str, native: bool) -> tuple[str, int]:
     rewritten = 0
-    out = []
-    for line in text.splitlines(keepends=True):
-        m = FN_POINTER_MEMBER.match(line.rstrip('\n'))
-        if m and m['ret'].strip():
-            ret = m['ret'].strip()
-            out.append(f"{m['indent']}::rt::guest_fn<{ret}({m['params']})> {m['name']};{m['rest']}\n")
-            rewritten += 1
-        else:
-            out.append(line)
-    text = ''.join(out)
-    for leftover in ANY_FN_POINTER.finditer(text):
-        lineno = text.count('\n', 0, leftover.start()) + 1
-        fail(f'{rel}:{lineno}: function pointer in a form the port does not handle')
-    if rewritten and '"runtime/original.h"' not in text:
-        text = add_include(text, '#include "runtime/original.h"\n')
+    if not native:
+        out = []
+        for line in text.splitlines(keepends=True):
+            m = FN_POINTER_MEMBER.match(line.rstrip('\n'))
+            if m and m['ret'].strip():
+                ret = m['ret'].strip()
+                out.append(
+                    f"{m['indent']}::rt::guest_fn<{ret}({m['params']})> {m['name']};{m['rest']}\n")
+                rewritten += 1
+            else:
+                out.append(line)
+        text = ''.join(out)
+        for leftover in ANY_FN_POINTER.finditer(text):
+            lineno = text.count('\n', 0, leftover.start()) + 1
+            fail(f'{rel}:{lineno}: function pointer in a form the port does not handle')
+        if rewritten and '"runtime/original.h"' not in text:
+            text = add_include(text, '#include "runtime/original.h"\n')
 
     if 'asm' in text:
         if rel != 'game/engine/thread.h' or text.count(THREAD_POINTER_ASM) != 1:
@@ -85,11 +92,15 @@ def port_source(rel: str, text: str) -> tuple[str, int]:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    args = sys.argv[1:]
+    native = args[:1] == ['--native']
+    if native:
+        args = args[1:]
+    if len(args) != 2:
         print(__doc__, file=sys.stderr)
         return 2
-    src = pathlib.Path(sys.argv[1])
-    out = pathlib.Path(sys.argv[2])
+    src = pathlib.Path(args[0])
+    out = pathlib.Path(args[1])
     game = src / 'game'
 
     with open(game / 'hooks.csv', newline='') as f:
@@ -104,20 +115,26 @@ def main() -> int:
         if path.suffix not in ('.cpp', '.c', '.h'):
             continue
         rel = path.relative_to(src).as_posix()
-        text, rewritten = port_source(rel, path.read_text())
+        text, rewritten = port_source(rel, path.read_text(), native)
         total_rewritten += rewritten
         names = [m['name'] for m in REPLACEMENT_DEF.finditer(text) if m['name'] in wanted]
         if names and path.suffix != '.cpp':
             fail(f'{rel}: hooked replacements are only exported from C++ sources')
         if names:
-            text += ('\n// Added by tools/paleblood_port.py: the HLE thunks the hook table '
-                     'points the originals at.\n#include "core/interpreter/hle.h"\n')
+            if native:
+                text += ('\n// Added by tools/paleblood_port.py: the addresses the hook table '
+                         'points the originals at.\n')
+            else:
+                text += ('\n// Added by tools/paleblood_port.py: the HLE thunks the hook table '
+                         'points the originals at.\n#include "core/interpreter/hle.h"\n')
             for name in names:
                 if name in defined:
                     fail(f'{name} is defined in both {defined[name]} and {rel}')
                 defined[name] = rel
+                target = (f'reinterpret_cast<unsigned long long>(&{name})' if native else
+                          f'::Core::Interpreter::HleThunk<&{name}>::Address()')
                 text += (f'extern "C" unsigned long long paleblood_thunk_{name}() {{\n'
-                         f'    return ::Core::Interpreter::HleThunk<&{name}>::Address();\n}}\n')
+                         f'    return {target};\n}}\n')
         dest = out / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.exists() or dest.read_text() != text:
@@ -145,8 +162,11 @@ def main() -> int:
     dest = out / 'paleblood_hooks.cpp'
     if not dest.exists() or dest.read_text() != table_text:
         dest.write_text(table_text)
-    print(f'paleblood_port.py: {len(hooks)} hooks, {total_rewritten} vtable slots routed through '
-          f'the interpreter')
+    if native:
+        print(f'paleblood_port.py: {len(hooks)} hooks (native)')
+    else:
+        print(f'paleblood_port.py: {len(hooks)} hooks, {total_rewritten} vtable slots routed '
+              f'through the interpreter')
     return 0
 
 

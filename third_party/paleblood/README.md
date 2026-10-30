@@ -8,7 +8,7 @@ code or data; Paleblood's own checks enforce that upstream.
 
 ## What's here
 
-Only what the wasm build compiles, copied unchanged by `scripts/sync_paleblood.sh`:
+Only what the builds compile, copied unchanged by `scripts/sync_paleblood.sh`:
 
 | Path | What |
 |---|---|
@@ -16,7 +16,7 @@ Only what the wasm build compiles, copied unchanged by `scripts/sync_paleblood.s
 | `game/hooks.csv` | which original address each replacement takes over |
 | `game/modules.csv` | Paleblood's module notes (reference only) |
 | `symbols/functions.csv` | the originals' sizes (a hook needs room for its jump) |
-| `runtime/include/runtime/{guest,original,hooks}.h` | the runtime interface the replacements are written against (reference: the build uses this port's versions) |
+| `runtime/include/runtime/{guest,original,hooks}.h` | the runtime interface the replacements are written against (the native build compiles against `guest.h` and `original.h`; the wasm build uses this port's versions) |
 
 Paleblood's verification harness, case generators, tools, Ghidra exports, documentation and its
 own runtime (a native Linux loader and system libraries) stay upstream. They need the game, or
@@ -30,6 +30,14 @@ and that function runs as compiled wasm instead of through the x86-64 interprete
 replacements reach the rest of the game through Paleblood's runtime interface, which the port
 implements on the interpreter (`patches/new_files/core/paleblood/port/runtime/`). Calls to
 originals run through it, and globals are plain memory.
+
+## How the native build uses it
+
+`scripts/build_native.sh` builds upstream shadPS4 for macOS with the same hook installer
+(`native/paleblood.cmake`). There the game's code runs directly, as it does under Paleblood's own
+runtime: the jump goes straight to the compiled replacement, and the replacements are compiled
+against `runtime/include` here, unchanged. The only change is the thread pointer read (below),
+which reads shadPS4's `fs:[0]` instead of `gs:[0]`.
 
 ## Local changes
 

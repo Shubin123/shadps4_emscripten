@@ -6,8 +6,14 @@
 #include <string>
 #include <fmt/format.h>
 #include "common/logging/log.h"
-#include "core/interpreter/cpu.h"
 #include "core/paleblood/paleblood.h"
+#ifdef ARCH_WASM
+#include "core/interpreter/cpu.h"
+#else
+#include "common/alignment.h"
+#include "core/memory.h"
+#include "core/tls.h"
+#endif
 
 // Paleblood's runtime/guest.h: where the executable's p_vaddr 0 is mapped.
 extern "C" {
@@ -41,6 +47,29 @@ bool Skipped(const Hook& hook) {
     return false;
 }
 
+bool WriteCode(u8* code, const u8* bytes, u64 size) {
+#ifdef ARCH_WASM
+    // The interpreter's decode cache checks an instruction's bytes before reusing it, so
+    // nothing stale of the original survives the patch.
+    std::memcpy(code, bytes, size);
+#else
+    // The executable's code is mapped without write access: open the pages for the write and
+    // give them their protection back after.
+    auto* memory = Core::Memory::Instance();
+    const VAddr address = reinterpret_cast<VAddr>(code);
+    const VAddr page = Common::AlignDown(address, 4_KB);
+    const u64 length = Common::AlignUp(address + size, 4_KB) - page;
+    u32 prot{};
+    if (memory->QueryProtection(address, nullptr, nullptr, &prot) != 0) {
+        return false;
+    }
+    memory->Protect(page, length, Core::MemoryProt(prot) | Core::MemoryProt::CpuReadWrite);
+    std::memcpy(code, bytes, size);
+    memory->Protect(page, length, Core::MemoryProt(prot));
+#endif
+    return true;
+}
+
 } // namespace
 
 u32 InstallHooks(u8* image, u64 size, std::span<const Hook> hooks) {
@@ -61,9 +90,10 @@ u32 InstallHooks(u8* image, u64 size, std::span<const Hook> hooks) {
         u8 jump[kJumpSize] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
         const u64 target = hook.thunk();
         std::memcpy(jump + 6, &target, sizeof(target));
-        // The interpreter's decode cache checks an instruction's bytes before reusing it, so
-        // nothing stale of the original survives the patch.
-        std::memcpy(image + offset, jump, sizeof(jump));
+        if (!WriteCode(image + offset, jump, sizeof(jump))) {
+            LOG_ERROR(Loader, "Paleblood: can't write {} at {:#010x}", hook.name, hook.address);
+            continue;
+        }
         installed++;
     }
     return installed;
@@ -93,8 +123,13 @@ void OnGameLoaded(VAddr eboot_base, u64 eboot_size, std::string_view serial,
 } // namespace Core::Paleblood
 
 unsigned char* paleblood_guest_thread_pointer() {
+#ifdef ARCH_WASM
     const u64 fs_base = Core::Interpreter::Cpu::Current().State().fs_base;
     unsigned char* tp;
     std::memcpy(&tp, reinterpret_cast<const void*>(fs_base), sizeof(tp));
     return tp;
+#else
+    // shadPS4 points each guest thread's fs at its TCB, whose first field is fs:[0].
+    return reinterpret_cast<unsigned char*>(Core::GetTcbBase());
+#endif
 }

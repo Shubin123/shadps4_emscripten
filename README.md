@@ -21,7 +21,9 @@ any platform.
 **Paleblood:** the build includes the verified C++ rewrites of Bloodborne functions from
 [Paleblood](https://github.com/Yharnam-Hunters/Paleblood), the Bloodborne decompilation
 (`third_party/paleblood`). When Bloodborne (CUSA03173, version 1.09) runs, those functions run as
-compiled wasm instead of through the interpreter. See PROJECT.md, "Paleblood".
+compiled wasm instead of through the interpreter. `scripts/build_native.sh` builds upstream
+shadPS4 for macOS with the same replacements (`scripts/run_native.sh` runs it). See PROJECT.md,
+"Paleblood".
 
 ## Quick start
 

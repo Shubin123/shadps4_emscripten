@@ -60,7 +60,8 @@ The results below are from version 01.00; with the 1.09 update next to it (as sh
 updates: extracted to a sibling `<game folder>-UPDATE`, whose files take precedence) the loader
 reports `App Version: 01.09`, loads the update's executable, and Paleblood installs all 32 of its
 replacements; the game then boots and renders the same way with them running. Upstream's macOS
-build (same revision) recognizes the same folder.
+build (same revision) recognizes the same folder, and with Paleblood built in
+(`scripts/build_native.sh`) runs the replacements too.
 
 - It boots: modules load, `main` runs, threads start, its network setup gets "no network"
   answers from the offline libSceNet instead of a NULL errno pointer (which crashed it before),
@@ -99,8 +100,9 @@ patches/new_files/           new sources, laid out like upstream's src/
   core/aerolib/stubs_wasm.cpp  unresolved-import stubs as thunks (natively: Xbyak trampolines)
   core/cpu_patches_wasm.cpp    no-op: nothing to patch when interpreting
   core/guest_call.h            Core::ExecuteGuest - the host->guest call site helper
-  core/paleblood/              Paleblood's game function replacements: hook installer, and the
-                               runtime interface they're written against, on the interpreter
+  core/paleblood/              Paleblood's game function replacements: hook installer (also
+                               built natively), and the runtime interface they're written
+                               against, on the interpreter
   shader_recompiler/backend/wgsl/   IR -> WGSL (the SPIR-V backend's counterpart)
   video_core/renderer_web/     Presenter/Rasterizer stand-ins and the WebGPU renderer: batches
                                (web_gpu), shader cache, draws (web_graphics), compute, resource
@@ -113,9 +115,13 @@ scripts/build_wasm.sh        configure + build
 scripts/run_node.sh          run a game headlessly under Node (on Dawn's WebGPU when installed)
 scripts/node_webgpu.mjs      gives Node a WebGPU implementation (`webgpu` package, Dawn)
 scripts/sync_paleblood.sh    Paleblood checkout -> third_party/paleblood
-third_party/paleblood/       Paleblood (Bloodborne decompilation), the parts the build compiles
+scripts/build_native.sh      upstream shadPS4 for macOS with Paleblood built in -> build/native
+scripts/run_native.sh        run build/native/shadps4
+native/paleblood.cmake       adds Paleblood to upstream's own CMake build, checkout untouched
+third_party/paleblood/       Paleblood (Bloodborne decompilation), the parts the builds compile
 tools/extract_pkg.py         fPKG -> game folder (upstream removed its extractor)
 tools/paleblood_port.py      third_party/paleblood -> build tree, ported for interpretation
+                             (--native: for upstream's build)
 tests/interpreter/           guest_code.s -> guest_code.inc (gen_guest_code.sh), test_main.cpp
 tests/shaders/               a game's GCN shaders -> WGSL -> WebGPU validation
 tests/gpu/                   hand-assembled GCN dispatches and draws on WebGPU, checked pixel
@@ -247,6 +253,39 @@ interpreter with it) through the rest of each frame.
   pointer. It also checks that a function too short for the jump is left alone. With Bloodborne
   1.09 (the base game plus its update), all 32 install and the game boots and renders with them
   in place (see "Bloodborne, end to end").
+
+### In upstream's native build
+
+`scripts/build_native.sh` builds upstream shadPS4 for macOS (x86_64, under Rosetta 2) with the
+same replacements, into `build/native`, and `scripts/run_native.sh` runs it. The shadPS4 checkout
+stays unmodified: `native/paleblood.cmake` is included into upstream's own CMake build
+(`CMAKE_PROJECT_shadPS4_INCLUDE`), adds the replacements and `core/paleblood`, and compiles
+`src/core/linker.cpp` from a copy with the one call that installs them, where the wasm patch
+makes it. KosmicKrisp, the Vulkan driver upstream builds from Mesa, is copied from upstream's
+official build of the same commit instead of being rebuilt.
+
+Natively the game's code runs directly, as under Paleblood's own runtime, so fewer things change:
+
+- The jump goes straight to the compiled replacement (no thunk), and the replacements are compiled
+  against Paleblood's own `runtime/guest.h` and `runtime/original.h`: a call to an original is a
+  call to its address, and vtable slots stay function pointers (`tools/paleblood_port.py
+  --native`).
+- The thread pointer read becomes `Core::GetTcbBase()`, since shadPS4 keeps the guest's thread
+  pointer at `fs:[0]` (on macOS, an LDT segment per thread), where Paleblood's loader moves it to
+  `gs:[0]`.
+- The memory manager has the executable's code as read+execute by then, so each jump is written
+  with its pages made writable through it, and their protection restored after.
+
+Tested with Bloodborne 1.09: `Paleblood: 32 of 32 replacement(s) installed`, and with invalid
+`BB_TARGET_FPS` and `BB_LIMITER_WAIT` values the replacements that read them print their
+warnings, so they run. Over 150 seconds the game gets as far as loading its FromSoftware logo with
+no critical errors, matching a `SHADPS4_PALEBLOOD=0` run of the same build (same pipelines compiled, files
+opened and errors logged).
+
+```
+scripts/build_native.sh                    # into build/native
+scripts/run_native.sh -g ../games/ps4/CUSA03173/eboot.bin
+```
 
 ## Graphics (M8)
 

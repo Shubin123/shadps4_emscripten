@@ -8,6 +8,10 @@
 // the same patch Paleblood's own runtime makes natively. Replacements reach the rest of the game
 // through Paleblood's runtime interface, which this port implements on the interpreter
 // (core/paleblood/port/runtime/*.h).
+//
+// The same code builds into shadPS4's own x86-64 build (native/paleblood.cmake). There the game's
+// code runs directly, so the jump goes straight to the compiled replacement, and the replacements
+// use Paleblood's runtime interface unchanged (third_party/paleblood/runtime/include).
 
 #pragma once
 
@@ -21,7 +25,9 @@ struct Hook {
     u32 address; // PS4 virtual address of the original, with the executable at 0x400000
     u32 size;    // the original's size in bytes (Paleblood's symbols/functions.csv)
     const char* name;
-    u64 (*thunk)(); // the replacement's HLE thunk address (core/interpreter/hle.h)
+    // Where the original jumps to: the replacement's HLE thunk (core/interpreter/hle.h) in the
+    // wasm build, the replacement itself natively.
+    u64 (*thunk)();
 };
 
 // Paleblood's target: Bloodborne CUSA03173 (EU) with update 1.09 merged.
@@ -46,5 +52,6 @@ void OnGameLoaded(VAddr eboot_base, u64 eboot_size, std::string_view serial,
 } // namespace Core::Paleblood
 
 // The calling guest thread's thread pointer (fs:[0]): Paleblood's engine::thread_pointer() reads
-// it with an x86 segment load natively; the build rewrites that read into a call to this.
+// it from gs:[0], where Paleblood's own loader moves it; the build rewrites that read into a call
+// to this.
 extern "C" unsigned char* paleblood_guest_thread_pointer();
